@@ -1,0 +1,14 @@
+bin/
+*.exe
+*.exe~
+*.test
+*.out
+.env
+*.log
+.DS_Store
+.cache/
+accounts.json
+accounts.jsonl
+dist/
+kiro-go.json
+*.sqlite3

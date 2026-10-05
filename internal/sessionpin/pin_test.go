@@ -1,0 +1,111 @@
+package sessionpin_test
+
+import (
+	"net/http"
+	"strings"
+	"testing"
+	"time"
+
+	"kiro-go/internal/sessionpin"
+)
+
+func TestKeyPrefersSessionHeader(t *testing.T) {
+	h := make(http.Header)
+	h.Set("X-Session-Id", "codex-abc")
+	got := sessionpin.Key(h, "ignored", []map[string]any{{"role": "user", "content": "hello"}})
+	if got != "hdr:codex-abc" {
+		t.Fatalf("key=%q", got)
+	}
+}
+
+func TestKeyPrefersOpenCodeSession(t *testing.T) {
+	h := make(http.Header)
+	h.Set("X-Opencode-Session", "ses_1")
+	got := sessionpin.Key(h, "pc-1", []map[string]any{{"role": "user", "content": "hello"}})
+	if got != "hdr:ses_1" {
+		t.Fatalf("key=%q", got)
+	}
+}
+
+func TestKeyUsesPromptCacheKey(t *testing.T) {
+	got := sessionpin.Key(nil, "pc-1", []map[string]any{{"role": "user", "content": "hello"}})
+	if got != "hdr:pc-1" {
+		t.Fatalf("key=%q", got)
+	}
+}
+
+func TestSessionLabelFromFirstUser(t *testing.T) {
+	got := sessionpin.SessionLabel([]map[string]any{
+		{"role": "system", "content": "bot"},
+		{"role": "user", "content": "  fix the   login bug  "},
+	})
+	if got != "fix the login bug" {
+		t.Fatalf("label=%q", got)
+	}
+	if sessionpin.SessionLabel([]map[string]any{{"role": "user", "content": strings.Repeat("x", 60)}}) == strings.Repeat("x", 60) {
+		t.Fatal("expected truncated session label")
+	}
+}
+
+func TestKeyStableFromFirstUserMessage(t *testing.T) {
+	first := []map[string]any{
+		{"role": "system", "content": "you are a bot"},
+		{"role": "user", "content": "fix the bug"},
+	}
+	later := []map[string]any{
+		{"role": "system", "content": "you are a bot"},
+		{"role": "user", "content": "fix the bug"},
+		{"role": "assistant", "content": "ok"},
+		{"role": "user", "content": "also tests"},
+	}
+	a := sessionpin.Key(nil, "", first)
+	b := sessionpin.Key(nil, "", later)
+	if a == "" || a != b {
+		t.Fatalf("expected stable conversation key, got %q vs %q", a, b)
+	}
+	other := sessionpin.Key(nil, "", []map[string]any{{"role": "user", "content": "different"}})
+	if other == a {
+		t.Fatal("different first user message must not collide")
+	}
+}
+
+func TestKeyIgnoresLaterToolTurns(t *testing.T) {
+	base := []map[string]any{
+		{"role": "user", "content": []any{map[string]any{"type": "text", "text": "open the file"}}},
+	}
+	withTools := []map[string]any{
+		{"role": "user", "content": []any{map[string]any{"type": "text", "text": "open the file"}}},
+		{"role": "assistant", "content": "calling read"},
+		{"role": "user", "content": "tool result"},
+	}
+	a := sessionpin.Key(nil, "", base)
+	b := sessionpin.Key(nil, "", withTools)
+	if a == "" || a != b {
+		t.Fatalf("tool turns must keep the first-user key, got %q vs %q", a, b)
+	}
+}
+
+func TestTableRememberLookupForget(t *testing.T) {
+	pins := sessionpin.New(time.Hour)
+	if _, ok := pins.Lookup("s1"); ok {
+		t.Fatal("empty table")
+	}
+	pins.Remember("s1", "acc-1")
+	id, ok := pins.Lookup("s1")
+	if !ok || id != "acc-1" {
+		t.Fatalf("lookup=%s ok=%v", id, ok)
+	}
+	pins.Forget("s1")
+	if _, ok := pins.Lookup("s1"); ok {
+		t.Fatal("forgot key still present")
+	}
+}
+
+func TestTableExpires(t *testing.T) {
+	pins := sessionpin.New(time.Millisecond)
+	pins.Remember("s1", "acc-1")
+	time.Sleep(5 * time.Millisecond)
+	if _, ok := pins.Lookup("s1"); ok {
+		t.Fatal("expired pin still present")
+	}
+}
