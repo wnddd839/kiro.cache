@@ -8,7 +8,8 @@ import (
 	"sync"
 	"time"
 
-	"kiro-go/internal/kiro"
+	"kiro-proxy/internal/kiro"
+	"kiro-proxy/internal/meter"
 )
 
 var (
@@ -58,6 +59,21 @@ func (c *catalog) window(id string) int {
 	return c.models[id].Context
 }
 
+// cacheMode 是本模型应该用的本地缓存计量模式。
+// catalog 里明确 PromptCaching.Supported=false 时强制 off；未拉到目录或模型不在表里保持默认。
+func (c *catalog) cacheMode(id, fallback string) string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	m, ok := c.models[id]
+	if !ok || m.PromptCaching == nil {
+		return fallback
+	}
+	if !m.PromptCaching.Supported {
+		return meter.ModeOff
+	}
+	return fallback
+}
+
 func (c *catalog) list() []kiro.Model {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -73,6 +89,12 @@ func (c *catalog) stale() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return time.Since(c.at) > catalogTTL
+}
+
+func (c *catalog) updated() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.at
 }
 
 func (c *catalog) merge(models []kiro.Model) {

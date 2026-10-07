@@ -20,6 +20,8 @@ type Request struct {
 	Thinking     *Thinking       `json:"thinking,omitzero"`
 	OutputConfig *OutputConfig   `json:"output_config,omitzero"`
 	Metadata     *Metadata       `json:"metadata,omitzero"`
+	// CacheControl 是顶层的自动缓存断点：落在最后一块上，随对话增长后移。只用于本地计量。
+	CacheControl *CacheControl `json:"cache_control,omitzero"`
 	// PromptCacheKey 不是 Anthropic 字段；OpenAI 兼容客户端会带，用作会话键。
 	PromptCacheKey string `json:"prompt_cache_key,omitzero"`
 }
@@ -52,6 +54,14 @@ type Tool struct {
 	Name        string          `json:"name"`
 	Description string          `json:"description,omitzero"`
 	InputSchema json.RawMessage `json:"input_schema,omitzero"`
+	// CacheControl 是 prompt cache 断点；只用于本地计量，不发给 Kiro。
+	CacheControl *CacheControl `json:"cache_control,omitzero"`
+}
+
+// CacheControl 标记一个 prompt cache 断点：到这里为止的前缀写入缓存。
+type CacheControl struct {
+	Type string `json:"type"`
+	TTL  string `json:"ttl,omitzero"` // "5m" | "1h"
 }
 
 // Block 是一个内容块。不同 type 用不同字段。
@@ -77,6 +87,8 @@ type Block struct {
 	// thinking
 	Thinking  string `json:"thinking,omitzero"`
 	Signature string `json:"signature,omitzero"`
+
+	CacheControl *CacheControl `json:"cache_control,omitzero"`
 }
 
 // Source 是图片 / 文档来源。
@@ -147,12 +159,21 @@ type ResponseBlock struct {
 	Input     json.RawMessage `json:"input,omitzero"`
 }
 
-// Usage 是 token 计数。
+// Usage 是 token 计数。Credits 是 Kiro 实际扣点（非 Anthropic 标准字段）。
+// cache_creation_input_tokens = cache_creation 里两项之和，与 Anthropic 一致。
 type Usage struct {
-	InputTokens              int `json:"input_tokens"`
-	OutputTokens             int `json:"output_tokens"`
-	CacheReadInputTokens     int `json:"cache_read_input_tokens"`
-	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+	InputTokens              int            `json:"input_tokens"`
+	OutputTokens             int            `json:"output_tokens"`
+	CacheReadInputTokens     int            `json:"cache_read_input_tokens"`
+	CacheCreationInputTokens int            `json:"cache_creation_input_tokens"`
+	CacheCreation            *CacheCreation `json:"cache_creation,omitzero"`
+	Credits                  float64        `json:"credits,omitzero"`
+}
+
+// CacheCreation 是缓存写入按 TTL 的拆分。
+type CacheCreation struct {
+	Ephemeral5m int `json:"ephemeral_5m_input_tokens"`
+	Ephemeral1h int `json:"ephemeral_1h_input_tokens"`
 }
 
 // ErrorBody 是 Anthropic 风格错误。

@@ -172,6 +172,41 @@ func (t *Table) Lookup(key string) (string, bool) {
 	return p.accountID, true
 }
 
+// PinSnapshot 是一个会话→号的落盘条目。
+type PinSnapshot struct {
+	Account string    `json:"account"`
+	Until   time.Time `json:"until"`
+}
+
+// Dump 是仍有效的粘滞。
+func (t *Table) Dump() map[string]PinSnapshot {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	now := time.Now()
+	out := make(map[string]PinSnapshot, len(t.m))
+	for k, p := range t.m {
+		if now.Before(p.until) {
+			out[k] = PinSnapshot{Account: p.accountID, Until: p.until}
+		}
+	}
+	return out
+}
+
+// Restore 载入粘滞，跳过过期的与已有的。返回载入条数。
+func (t *Table) Restore(in map[string]PinSnapshot) int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	now, n := time.Now(), 0
+	for k, p := range in {
+		if _, ok := t.m[k]; ok || p.Account == "" || !now.Before(p.Until) || len(t.m) >= maxEntries {
+			continue
+		}
+		t.m[k] = pin{accountID: p.Account, until: p.Until}
+		n++
+	}
+	return n
+}
+
 func (t *Table) Forget(key string) {
 	if t == nil {
 		return

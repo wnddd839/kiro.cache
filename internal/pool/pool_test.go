@@ -1,10 +1,12 @@
 package pool
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -15,7 +17,7 @@ import (
 	"testing"
 	"time"
 
-	"kiro-go/internal/kiro"
+	"kiro-proxy/internal/kiro"
 )
 
 const testArn = "arn:aws:codewhisperer:us-east-1:111111111111:profile/TEST"
@@ -27,6 +29,8 @@ type fakeKiro struct {
 	refreshHits  atomic.Int64
 	profileHits  atomic.Int64
 	refreshCode  atomic.Int64 // 0 = 200
+	refreshBody  string       // 非 200 时的响应体；空 = 默认 JSON
+	onRefresh    func()       // 每次 refresh 请求时调用（测并发）
 	refreshDelay time.Duration
 
 	mu     sync.Mutex
@@ -40,12 +44,22 @@ func newFakeKiro(t *testing.T) *fakeKiro {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /refreshToken", func(w http.ResponseWriter, r *http.Request) {
 		f.refreshHits.Add(1)
+		if f.onRefresh != nil {
+			f.onRefresh()
+		}
 		if f.refreshDelay > 0 {
 			time.Sleep(f.refreshDelay)
 		}
 		if c := f.refreshCode.Load(); c != 0 {
+			body := f.refreshBody
+			if body == "" {
+				body = `{"message":"Invalid refresh token"}`
+			}
+			if strings.HasPrefix(body, "<") {
+				w.Header().Set("Content-Type", "text/html")
+			}
 			w.WriteHeader(int(c))
-			_, _ = w.Write([]byte(`{"message":"Invalid refresh token"}`))
+			_, _ = w.Write([]byte(body))
 			return
 		}
 		n := f.nextAT.Add(1)
@@ -304,6 +318,7 @@ func TestAcquirePinnedUnavailableFallsBack(t *testing.T) {
 			p.Fail("a", kiro.Failure{Status: 429, Class: kiro.ClassThrottle})
 		}},
 		{name: "at max concurrent", setup: func(t *testing.T, p *Pool) {
+			p.pinWait = 10 * time.Millisecond
 			p.slotFor(t, "a").acct.MaxConcurrent = 1
 			mustAcquire(t, p, "", "b") // 占满 a
 		}},
@@ -373,19 +388,29 @@ func TestAcquireTieBreakByRemainingCredits(t *testing.T) {
 	}
 }
 
-func TestAcquireTieBreakByLastUsed(t *testing.T) {
-	p, _ := openPool(t, nil)
-	mustAdd(t, p, Account{ID: "a", Cred: freshCred("a")})
-	mustAdd(t, p, Account{ID: "b", Cred: freshCred("b")})
-	clock := time.Now()
-	p.now = func() time.Time { return clock }
-	first := mustAcquire(t, p, "")
-	first.Release()
-	clock = clock.Add(time.Second)
-	second := mustAcquire(t, p, "")
-	second.Release()
-	if first.ID == second.ID {
-		t.Fatalf("both picks %s; want least recently used to rotate", first.ID)
+// 同一额度档（每 20% 一档）内随机：新号不会把新会话全吸走。
+func TestAcquireSpreadsWithinQuotaTier(t *testing.T) {
+	fk := newFakeKiro(t)
+	p, _ := openPool(t, fk.client())
+	for _, id := range []string{"old", "new", "low"} {
+		mustAdd(t, p, Account{ID: id, Cred: freshCred("tok-" + id)})
+	}
+	fk.setUsage("tok-old", 15, 100) // 剩 85%
+	fk.setUsage("tok-new", 0, 100)  // 剩 100%（新号）
+	fk.setUsage("tok-low", 50, 100) // 剩 50%：低一档
+	for _, id := range []string{"old", "new", "low"} {
+		if _, err := p.RefreshLimits(t.Context(), id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	count := map[string]int{}
+	for range 400 {
+		l := mustAcquire(t, p, "")
+		count[l.ID]++
+		l.Release()
+	}
+	if count["low"] != 0 || count["old"] < 120 || count["new"] < 120 {
+		t.Fatalf("picks %v: want old/new (same 80%%+ tier) shared, low never", count)
 	}
 }
 
@@ -428,6 +453,30 @@ func TestMaxConcurrent(t *testing.T) {
 	l3 := mustAcquire(t, p, "")
 	l2.Release()
 	l3.Release()
+}
+
+// 号上没设 max_concurrent 时用号池默认上限；号上设了的优先。
+func TestMaxConcurrentPoolDefault(t *testing.T) {
+	p, err := Open(filepath.Join(t.TempDir(), "pool.json"), Options{Logger: quiet(), MaxConcurrent: 3, PinWait: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustAdd(t, p, Account{ID: "a", Cred: freshCred("a")})
+	for range 3 {
+		mustAcquire(t, p, "")
+	}
+	if _, err := p.Acquire("", nil); !errors.Is(err, ErrNoAccount) {
+		t.Fatalf("4th Acquire err = %v, want busy", err)
+	}
+	if err := p.SetMaxConcurrent("a", 5); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		mustAcquire(t, p, "")
+	}
+	if _, err := p.Acquire("", nil); !errors.Is(err, ErrNoAccount) {
+		t.Fatalf("6th Acquire err = %v, want busy", err)
+	}
 }
 
 func TestLeaseReleaseIdempotent(t *testing.T) {
@@ -509,6 +558,59 @@ func TestFailQuotaUsesResetAt(t *testing.T) {
 	}
 }
 
+// 429 "Rate exceeded" 是限流：只短冷却（有 Retry-After 按它，上限 5 分钟；没有就退避）。
+// 402 与带 MONTHLY_REQUEST_COUNT 的返回才冷却到 ResetAt。
+func TestRateExceededIsNotQuota(t *testing.T) {
+	reset := time.Now().Add(20 * 24 * time.Hour).Truncate(time.Second)
+	fresh := func(t *testing.T) (*Pool, time.Time) {
+		p, _ := openPool(t, nil)
+		mustAdd(t, p, Account{ID: "a", Cred: freshCred("a")})
+		clock := time.Now()
+		p.now = func() time.Time { return clock }
+		p.slotFor(t, "a").limits = kiro.Limits{Used: 1, Limit: 10, ResetAt: reset}
+		return p, clock
+	}
+	fail := func(p *Pool, status int, body string, h http.Header) {
+		f := kiro.Classify(status, []byte(body))
+		f.RetryAfter = kiro.RetryAfter(h)
+		p.Fail("a", f)
+	}
+	for _, tc := range []struct {
+		name string
+		body string
+		h    http.Header
+		want time.Duration
+	}{
+		{"no retry-after", `{"message":"Rate exceeded"}`, nil, 15 * time.Second},
+		{"retry-after", `{"__type":"ThrottlingException","message":"Rate exceeded"}`, http.Header{"Retry-After": {"7"}}, 7 * time.Second},
+		{"retry-after capped", `Too many requests`, http.Header{"Retry-After": {"86400"}}, 5 * time.Minute},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, clock := fresh(t)
+			fail(p, 429, tc.body, tc.h)
+			if d := p.slotFor(t, "a").cooldown.Sub(clock); d != tc.want {
+				t.Fatalf("cooldown = %v, want %v (reason %q)", d, tc.want, p.slotFor(t, "a").cooldownWhy)
+			}
+		})
+	}
+	for _, tc := range []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{"402", 402, `{"message":"Payment required"}`},
+		{"429 monthly", 429, `{"message":"You have reached the limit.","reason":"MONTHLY_REQUEST_COUNT"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, _ := fresh(t)
+			fail(p, tc.status, tc.body, nil)
+			if got := p.slotFor(t, "a").cooldown; !got.Equal(reset) {
+				t.Fatalf("cooldown = %v, want ResetAt %v", got, reset)
+			}
+		})
+	}
+}
+
 func TestFailThrottleBackoffGrows(t *testing.T) {
 	p, _ := openPool(t, nil)
 	mustAdd(t, p, Account{ID: "a", Cred: freshCred("a")})
@@ -531,7 +633,7 @@ func TestFailThrottleBackoffGrows(t *testing.T) {
 		clock = clock.Add(d) // 冷却结束后再次被限流
 	}
 	// Success 清零 strikes
-	p.Success("a", kiro.Usage{})
+	p.Success("a", kiro.Usage{}, 0, false)
 	p.Fail("a", kiro.Failure{Class: kiro.ClassThrottle})
 	if d := p.slotFor(t, "a").cooldown.Sub(clock); d != 15*time.Second {
 		t.Errorf("after Success backoff = %v, want 15s", d)
@@ -746,7 +848,8 @@ func TestCredRefreshOnlyAccount(t *testing.T) {
 
 func TestCredRefreshRejectedDisables(t *testing.T) {
 	fk := newFakeKiro(t)
-	fk.refreshCode.Store(http.StatusUnauthorized)
+	fk.refreshCode.Store(http.StatusBadRequest)
+	fk.refreshBody = `{"error":"invalid_grant","error_description":"Invalid refresh token provided"}`
 	p, path := openPool(t, fk.client())
 	c := freshCred("old")
 	c.ExpiresAt = time.Now().Add(-time.Minute)
@@ -928,11 +1031,11 @@ func TestSuccessStatsAndTotals(t *testing.T) {
 	p, _ := openPool(t, nil)
 	mustAdd(t, p, Account{ID: "a", Cred: freshCred("a")})
 	mustAdd(t, p, Account{ID: "b", Cred: freshCred("b")})
-	p.Success("a", kiro.Usage{Input: 10, Output: 5, CacheRead: 30, CacheWrite: 0})
-	p.Success("a", kiro.Usage{Input: 10, Output: 5, CacheRead: 0, CacheWrite: 10})
-	p.Success("b", kiro.Usage{Input: 1, Output: 2, CacheRead: 3, CacheWrite: 4})
+	p.Success("a", kiro.Usage{Input: 10, Output: 5, CacheRead: 30, CacheWrite: 0}, 0, false)
+	p.Success("a", kiro.Usage{Input: 10, Output: 5, CacheRead: 0, CacheWrite: 10}, 0, false)
+	p.Success("b", kiro.Usage{Input: 1, Output: 2, CacheRead: 3, CacheWrite: 4}, 0, false)
 	p.Fail("b", kiro.Failure{Class: kiro.ClassFatal})
-	p.Success("missing", kiro.Usage{Input: 1000})
+	p.Success("missing", kiro.Usage{Input: 1000}, 0, false)
 
 	va, _ := p.Get("a")
 	if va.Stats.Requests != 2 || va.Stats.InputTokens != 20 || va.HitRate != 0.5 {
@@ -960,5 +1063,289 @@ func TestListOrderAndRedaction(t *testing.T) {
 	raw, _ := json.Marshal(vs)
 	if strings.Contains(string(raw), "secret-") {
 		t.Errorf("View leaks token: %s", raw)
+	}
+}
+
+// 钉的号只是并发打满：先短暂排队等它；等到了就还用它（命中粘滞），不换号。
+func TestAcquirePinnedBusyWaits(t *testing.T) {
+	p, _ := openPool(t, nil)
+	mustAdd(t, p, Account{ID: "a", MaxConcurrent: 1, Cred: freshCred("a")})
+	mustAdd(t, p, Account{ID: "b", Cred: freshCred("b")})
+	p.Pin("sess", "a")
+	busy := mustAcquire(t, p, "sess")
+	if busy.ID != "a" {
+		t.Fatalf("first lease %s", busy.ID)
+	}
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		busy.Release()
+	}()
+	l := mustAcquire(t, p, "sess")
+	defer l.Release()
+	if l.ID != "a" || !l.Pinned || l.Overflow {
+		t.Fatalf("lease = %+v, want a pinned after waiting", l)
+	}
+}
+
+// 等不到：借用别的号并标 Overflow，调用方据此不改钉。
+func TestAcquirePinnedBusyOverflow(t *testing.T) {
+	p, _ := openPool(t, nil)
+	mustAdd(t, p, Account{ID: "a", MaxConcurrent: 1, Cred: freshCred("a")})
+	mustAdd(t, p, Account{ID: "b", Cred: freshCred("b")})
+	p.Pin("sess", "a")
+	busy := mustAcquire(t, p, "sess")
+	defer busy.Release()
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Millisecond)
+	defer cancel()
+	l, err := p.AcquireContext(ctx, "sess", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Release()
+	if l.ID != "b" || l.Pinned || !l.Overflow {
+		t.Fatalf("lease = %+v, want b overflow", l)
+	}
+	if id, _ := p.pins.Lookup("sess"); id != "a" {
+		t.Fatalf("pin moved to %s", id)
+	}
+}
+
+// 未归属 credits：额度增量 − 账本记的；重置后从新基线累计。
+func TestRecon(t *testing.T) {
+	s := &slot{}
+	t0 := time.Unix(1_700_000_000, 0)
+	s.reconLocked(kiro.Limits{Used: 10}, t0)
+	s.metered += 1.5 // 账本记了 1.5
+	s.reconLocked(kiro.Limits{Used: 12, Overage: 0.5}, t0.Add(time.Minute))
+	if r := s.recon; r.Upstream != 2.5 || r.Recorded != 1.5 || r.Reported != 1.5 || r.Estimated != 0 || r.Unassigned != 1 {
+		t.Fatalf("recon = %+v", r)
+	}
+	s.estimated += 0.4 // 中断的尝试：按 token 估的
+	s.reconLocked(kiro.Limits{Used: 12.4, Overage: 0.5}, t0.Add(90*time.Second))
+	if r := s.recon; math.Abs(r.Estimated-0.4) > 1e-9 || math.Abs(r.Recorded-1.9) > 1e-9 || math.Abs(r.Unassigned-1) > 1e-9 {
+		t.Fatalf("recon with estimate = %+v", r)
+	}
+	s.reconLocked(kiro.Limits{Used: 0.2}, t0.Add(2*time.Minute)) // 重置
+	s.metered += 0.3
+	s.reconLocked(kiro.Limits{Used: 0.5}, t0.Add(3*time.Minute))
+	if r := s.recon; r.Resets != 1 || math.Abs(r.Unassigned-1) > 1e-9 || math.Abs(r.Upstream-3.2) > 1e-9 {
+		t.Fatalf("after reset = %+v", r)
+	}
+}
+
+// 刷新返回 403 HTML 防火墙页：不停号，只计一次失败并冷却。
+func TestRefreshFirewall403DoesNotDisable(t *testing.T) {
+	fk := newFakeKiro(t)
+	fk.refreshCode.Store(http.StatusForbidden)
+	fk.refreshBody = `<html><body><h1>403 Forbidden</h1>Request blocked by firewall</body></html>`
+	p, _ := openPool(t, fk.client())
+	c := freshCred("old")
+	c.ExpiresAt = time.Now().Add(-time.Minute)
+	mustAdd(t, p, Account{ID: "a", Cred: c})
+	if _, err := p.Cred(t.Context(), "a", ""); err == nil {
+		t.Fatal("want error")
+	}
+	v, _ := p.Get("a")
+	if v.Disabled || v.RefreshFails != 1 || v.CooldownUntil.IsZero() {
+		t.Fatalf("view = disabled %v fails %d cooldown %v", v.Disabled, v.RefreshFails, v.CooldownUntil)
+	}
+}
+
+// 400 invalid_grant：立即停号（见 TestCredRefreshRejectedDisables）；连续 3 次 401 才停号，成功一次清零。
+func TestRefresh401ThreeStrikes(t *testing.T) {
+	fk := newFakeKiro(t)
+	p, _ := openPool(t, fk.client())
+	c := freshCred("old")
+	c.ExpiresAt = time.Now().Add(-time.Minute)
+	mustAdd(t, p, Account{ID: "a", Cred: c})
+
+	fk.refreshCode.Store(http.StatusUnauthorized)
+	for i := 1; i <= 2; i++ {
+		_, _ = p.Cred(t.Context(), "a", "")
+		if v, _ := p.Get("a"); v.Disabled || v.RefreshFails != i {
+			t.Fatalf("after %d: disabled %v fails %d", i, v.Disabled, v.RefreshFails)
+		}
+	}
+	// 成功一次清零
+	fk.refreshCode.Store(0)
+	if _, err := p.Cred(t.Context(), "a", ""); err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := p.Get("a"); v.RefreshFails != 0 {
+		t.Fatalf("success did not reset: %d", v.RefreshFails)
+	}
+	fk.refreshCode.Store(http.StatusUnauthorized)
+	for i := 1; i <= 3; i++ {
+		if _, err := p.ForceRefresh(t.Context(), "a"); err == nil {
+			t.Fatal("want error")
+		}
+		v, _ := p.Get("a")
+		if want := i == 3; v.Disabled != want {
+			t.Fatalf("after %d consecutive 401: disabled %v (note %q)", i, v.Disabled, v.Note)
+		}
+	}
+}
+
+// 全局熔断：5 个号同时刷新拿到 403 HTML（防火墙 / 上游异常），反复多轮也一个都不停。
+func TestBreakerRefresh403StormDisablesNone(t *testing.T) {
+	fk := newFakeKiro(t)
+	fk.refreshCode.Store(http.StatusForbidden)
+	fk.refreshBody = `<html><body><h1>403 Forbidden</h1>Request blocked</body></html>`
+	p, path := openPool(t, fk.client())
+	clock := time.Now()
+	p.now = func() time.Time { return clock }
+	ids := []string{"a", "b", "c", "d", "e"}
+	for _, id := range ids {
+		c := freshCred(id)
+		c.ExpiresAt = time.Now().Add(-time.Minute)
+		mustAdd(t, p, Account{ID: id, Cred: c})
+	}
+	// 持续约 3 分钟：每轮间隔一个刷新冷却，每轮 5 个号都刷新失败
+	for round := range 4 {
+		var wg sync.WaitGroup
+		for _, id := range ids {
+			wg.Go(func() {
+				if _, err := p.ForceRefresh(t.Context(), id); err == nil {
+					t.Error("want error")
+				}
+			})
+		}
+		wg.Wait()
+		if b := p.Breaker(); !b.Open || b.Kinds[0].Kind != FailForbidden || b.Kinds[0].Accounts != 5 {
+			t.Fatalf("round %d breaker = %+v", round, b)
+		}
+		clock = clock.Add(refreshCooldown)
+	}
+	for _, v := range p.List() {
+		if v.Disabled || v.RefreshFails >= maxRefreshFailures {
+			t.Errorf("%s: disabled %v fails %d note %q", v.ID, v.Disabled, v.RefreshFails, v.Note)
+		}
+	}
+	for _, a := range readFile(t, path).Accounts {
+		if a.Disabled {
+			t.Errorf("%s disabled on disk", a.ID)
+		}
+	}
+	// 任意请求成功就解除熔断
+	p.Success("a", kiro.Usage{}, 0, false)
+	if b := p.Breaker(); b.Open {
+		t.Fatalf("breaker after success = %+v", b)
+	}
+}
+
+// 熔断有下限：只有一个号在失败时（哪怕它就是全部的号）按单号逻辑走，连续 3 次 401 照样停号。
+func TestBreakerSingleAccount401StillDisables(t *testing.T) {
+	for _, accounts := range []int{1, 5} {
+		t.Run(fmt.Sprint(accounts), func(t *testing.T) {
+			fk := newFakeKiro(t)
+			fk.refreshCode.Store(http.StatusUnauthorized)
+			p, _ := openPool(t, fk.client())
+			for i := range accounts {
+				mustAdd(t, p, Account{ID: fmt.Sprint("a", i), Cred: freshCred(fmt.Sprint("a", i))})
+			}
+			for i := 1; i <= maxRefreshFailures; i++ {
+				_, _ = p.ForceRefresh(t.Context(), "a0")
+				if v, _ := p.Get("a0"); v.Disabled != (i == maxRefreshFailures) {
+					t.Fatalf("after %d: disabled %v fails %d", i, v.Disabled, v.RefreshFails)
+				}
+			}
+			if b := p.Breaker(); b.Open {
+				t.Fatalf("breaker = %+v", b)
+			}
+		})
+	}
+}
+
+// 熔断期间 invalid_grant 与封号文字照样立即停号。
+func TestBreakerDoesNotShieldDefiniteEvidence(t *testing.T) {
+	fk := newFakeKiro(t)
+	fk.refreshCode.Store(http.StatusForbidden)
+	fk.refreshBody = `<html>blocked</html>`
+	p, _ := openPool(t, fk.client())
+	for _, id := range []string{"a", "b", "c"} {
+		mustAdd(t, p, Account{ID: id, Cred: freshCred(id)})
+		_, _ = p.ForceRefresh(t.Context(), id)
+	}
+	if !p.Breaker().Open {
+		t.Fatal("want breaker open")
+	}
+	fk.refreshCode.Store(http.StatusBadRequest)
+	fk.refreshBody = `{"error":"invalid_grant"}`
+	_, _ = p.ForceRefresh(t.Context(), "a")
+	p.Fail("b", kiro.Classify(403, []byte(`{"message":"Your account is TemporarilySuspended"}`)))
+	for id, want := range map[string]bool{"a": true, "b": true, "c": false} {
+		if v, _ := p.Get(id); v.Disabled != want {
+			t.Errorf("%s disabled = %v, want %v (%q)", id, v.Disabled, want, v.Note)
+		}
+	}
+}
+
+// 每个号一个固定机器码：加号时生成（来源带了就沿用），落盘，重新打开后不变；旧号第一次用时补上。
+func TestMachineIDStable(t *testing.T) {
+	fk := newFakeKiro(t)
+	p, path := openPool(t, fk.client())
+	a := mustAdd(t, p, Account{ID: "a", Cred: freshCred("a")})
+	b := mustAdd(t, p, Account{ID: "b", Cred: func() kiro.Cred { c := freshCred("b"); c.MachineID = "feedfacefeedfacefeedfacefeedface"; return c }()})
+	if len(a.Cred.MachineID) != 32 || b.Cred.MachineID != "feedfacefeedfacefeedfacefeedface" || a.Cred.MachineID == b.Cred.MachineID {
+		t.Fatalf("machine ids %q %q", a.Cred.MachineID, b.Cred.MachineID)
+	}
+	c1, _ := p.Cred(t.Context(), "a", "")
+	c2, _ := p.ForceRefresh(t.Context(), "a")
+	if c1.MachineID != a.Cred.MachineID || c2.MachineID != a.Cred.MachineID {
+		t.Fatalf("machine id changed: %q %q want %q", c1.MachineID, c2.MachineID, a.Cred.MachineID)
+	}
+	if f := readFile(t, path); f.Accounts[0].Cred.MachineID != a.Cred.MachineID {
+		t.Fatalf("not persisted: %+v", f.Accounts[0].Cred)
+	}
+	// 旧号（文件里没有机器码）：第一次用时生成并落盘
+	legacy := filepath.Join(t.TempDir(), "accounts.json")
+	raw, _ := json.Marshal(file{Accounts: []Account{{ID: "old", Cred: freshCred("old")}}})
+	if err := os.WriteFile(legacy, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	q, err := Open(legacy, Options{Client: fk.client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := q.Cred(t.Context(), "old", "")
+	if len(got.MachineID) != 32 || readFile(t, legacy).Accounts[0].Cred.MachineID != got.MachineID {
+		t.Fatalf("legacy account machine id %q not persisted", got.MachineID)
+	}
+}
+
+// 全局刷新并发上限：8 个号同时到期，同一时刻最多 2 个在刷。
+func TestRefreshConcurrencyLimit(t *testing.T) {
+	fk := newFakeKiro(t)
+	var cur, peak atomic.Int64
+	fk.onRefresh = func() {
+		n := cur.Add(1)
+		for {
+			p := peak.Load()
+			if n <= p || peak.CompareAndSwap(p, n) {
+				break
+			}
+		}
+		time.Sleep(30 * time.Millisecond)
+		cur.Add(-1)
+	}
+	p, err := Open(filepath.Join(t.TempDir(), "accounts.json"), Options{Client: fk.client(), Logger: quiet(), RefreshConcurrency: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range 8 {
+		c := freshCred(fmt.Sprint("t", i))
+		c.ExpiresAt = time.Now().Add(-time.Minute)
+		mustAdd(t, p, Account{ID: fmt.Sprint("a", i), Cred: c})
+	}
+	var wg sync.WaitGroup
+	for i := range 8 {
+		wg.Go(func() { _, _ = p.Cred(t.Context(), fmt.Sprint("a", i), "") })
+	}
+	wg.Wait()
+	if got := fk.refreshHits.Load(); got != 8 {
+		t.Fatalf("refreshes = %d", got)
+	}
+	if peak.Load() > 2 {
+		t.Fatalf("peak concurrent refreshes = %d, want <= 2", peak.Load())
 	}
 }

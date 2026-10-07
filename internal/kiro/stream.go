@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"math"
 	"strings"
 )
 
@@ -23,12 +24,51 @@ const (
 	EvError
 )
 
-// Usage 是上游报告的 token 记账。CacheRead / CacheWrite 是判断 cache 是否打中的依据。
+// Usage 是上游报告的记账。Kiro 实际只报 credits 与上下文百分比；token 数是估算或为 0。
+// 下游的 token / 缓存计量在 meter 包里本地计算，再用上下文百分比校正总量。
 type Usage struct {
-	Input      int
-	Output     int
+	Input      int // tokenUsage 报了就用它，否则是上下文百分比×窗口：本轮全部上下文，含 Kiro 自带部分与本轮输出
+	Output     int // tokenUsage 报了就用它，否则按输出字符估算
 	CacheRead  int
 	CacheWrite int
+
+	Credits    float64 // meteringEvent 的 usage 之和
+	ContextPct float64 // 上下文占用百分比（含 Kiro 自己的 system）
+	// Reported 表示上游报了输入侧 tokenUsage（uncached / input / cacheRead / cacheWrite 至少一项非零）：
+	// 此时 Input/Cache* 是上游的真实计数，优先于本地模拟。只报 outputTokens（或全 0）不算，
+	// 否则会用 0 覆盖本地拆分并跳过上下文校准。Output 是否可信看 Output > 0。
+	Reported bool
+	// OutputReported 表示 Output 是上游报的 outputTokens，不是按字符估算的。
+	OutputReported bool
+
+	// 以下只用于交叉核对与探测，不参与计费。
+	TotalTokens int     // tokenUsage.totalTokens（最后一次报的）
+	Normalized  float64 // tokenUsage.normalizedTokenUsage：MPS 按 credit 配置折算的用量
+	UsageEvents int     // 带 tokenUsage 的事件个数；>1 时要确认是增量还是累计
+	// UsageRaw 是每一条 tokenUsage 的原值（只在多于一条时保留，写调试日志用）
+	UsageRaw       *[]string
+	MeteringEvents int    // meteringEvent 个数
+	MeteringUnit   string // meteringEvent.unit
+}
+
+// HiddenTokens 是 Kiro 自己放进上下文、不属于下游请求的 token（它的 system 与对话模板）。
+// 实测（2026-10-07）：只发 "Reply with just: ok"、回 "ok" 时的上游上下文 token 减去这两段。
+// 没测过的模型按 Claude 的值；基线差几百 token，对长对话的影响不到 1%。
+func HiddenTokens(model string) int {
+	if n, ok := hiddenTokens[strings.ToLower(model)]; ok {
+		return n
+	}
+	return hiddenClaude
+}
+
+const hiddenClaude = 4052 // claude-sonnet-4.5 / claude-haiku-4.5 / claude-sonnet-4 / auto
+
+var hiddenTokens = map[string]int{
+	"deepseek-3.2":     3699,
+	"minimax-m2.5":     3864,
+	"minimax-m2.1":     3640,
+	"glm-5":            3883,
+	"qwen3-coder-next": 3646,
 }
 
 // Event 是一条解码后的回复事件。
@@ -137,11 +177,110 @@ type Decoder struct {
 	pct     float64
 	said    int
 	failure string
+
+	lastUsage string // 上一条 tokenUsage 原值
+
+	// Mode 是多条 tokenUsage 的合并方式：只有 ReportedSum 累加，其它都取最后一条。
+	Mode string
+
+	// Trace 非 nil 时收到每一帧的事件类型与原始 payload（探测工具用）
+	Trace func(event string, payload []byte)
 }
 
 // NewDecoder 建解码器。thinking 为 true 时把开头的 <thinking>…</thinking> 拆成 think 事件。
 func NewDecoder(r io.Reader, thinking bool, window int, names map[string]string) *Decoder {
 	return &Decoder{r: bufio.NewReaderSize(r, 64<<10), thinking: thinking, window: window, names: names}
+}
+
+// tokenUsageFields 是一条 tokenUsage。指针区分「字段缺失」与「值为 0」。
+type tokenUsageFields struct {
+	Uncached   *int     `json:"uncachedInputTokens"`
+	Input      *int     `json:"inputTokens"`
+	Output     *int     `json:"outputTokens"`
+	CacheRead  *int     `json:"cacheReadInputTokens"`
+	CacheWrite *int     `json:"cacheWriteInputTokens"`
+	Pct        *float64 `json:"contextUsagePercentage"`
+	Total      *int     `json:"totalTokens"`
+	Normalized *float64 `json:"normalizedTokenUsage"`
+}
+
+func val(p *int) int {
+	if p == nil {
+		return 0
+	}
+	return *p
+}
+
+// tokenUsage 记一条 tokenUsage。
+//
+// 多条时不累加，取最后一条：上游若发的是累计值，累加会多收；若是增量，取最后一条只会少收。
+// 每条原值留在 UsageRaw 里，调用方告警并写调试日志。credits（meteringEvent）照常累加。
+//
+// uncachedInputTokens 缺失时用 inputTokens − cacheRead − cacheWrite 推算（inputTokens 可能是含缓存的总输入）；
+// 字段在但是 0 就是 0。
+func (d *Decoder) tokenUsage(raw json.RawMessage) {
+	var tu tokenUsageFields
+	if json.Unmarshal(raw, &tu) != nil {
+		return
+	}
+	d.usage.UsageEvents++
+	if d.usage.UsageEvents == 2 {
+		d.usage.UsageRaw = &[]string{d.lastUsage}
+	}
+	if d.usage.UsageEvents >= 2 {
+		*d.usage.UsageRaw = append(*d.usage.UsageRaw, string(raw))
+	}
+	d.lastUsage = string(raw)
+	if tu.Total != nil {
+		d.usage.TotalTokens = *tu.Total
+	}
+	if tu.Normalized != nil {
+		d.usage.Normalized = *tu.Normalized
+	}
+	read, write := val(tu.CacheRead), val(tu.CacheWrite)
+	var in int
+	switch {
+	case tu.Uncached != nil:
+		in = *tu.Uncached
+	case tu.Input != nil:
+		in = max(0, *tu.Input-read-write)
+	}
+	reported := tu.Uncached != nil || tu.Input != nil || tu.CacheRead != nil || tu.CacheWrite != nil
+	if d.Mode == ReportedSum && d.usage.UsageEvents > 1 {
+		d.usage.Input += in
+		d.usage.CacheRead += read
+		d.usage.CacheWrite += write
+		d.usage.Output += val(tu.Output)
+	} else {
+		d.usage.Input, d.usage.CacheRead, d.usage.CacheWrite = in, read, write
+		d.usage.Output = val(tu.Output)
+	}
+	d.usage.Reported = d.usage.Reported || reported
+	d.usage.OutputReported = d.usage.OutputReported || tu.Output != nil
+	if tu.Pct != nil && *tu.Pct > 0 {
+		d.pct = *tu.Pct
+	}
+}
+
+// ReportedMode 是上游报了 tokenUsage 时怎么用它。等 `probe usage` 有结论再定口径；
+// 默认 ReportedConservative：取最后一条、不累加、扣隐藏 token，不会多收。
+const (
+	// ReportedConservative：多条取最后一条；输入侧扣掉 Kiro 隐藏 token（先扣 uncached 再扣 cacheRead）。
+	ReportedConservative = "conservative"
+	// ReportedRaw：多条取最后一条；输入侧原样用（确认上游不含隐藏部分后再用）。
+	ReportedRaw = "raw"
+	// ReportedSum：多条累加（确认上游发的是增量后再用）；输入侧扣隐藏 token。
+	ReportedSum = "sum"
+	// ReportedIgnore：不用上游 tokenUsage，只用本地拆分 + 上下文百分比校准。
+	ReportedIgnore = "ignore"
+)
+
+// Partial 是到目前为止上游已报的记账（credits、tokenUsage），用于中途断开时入账。
+// 不能与 Next 并发调用。
+func (d *Decoder) Partial() Usage {
+	u := d.usage
+	u.ContextPct = d.pct
+	return u
 }
 
 // Next 返回下一条事件。流结束后返回 io.EOF；最后一条总是 EvStop 或 EvError。
@@ -166,6 +305,9 @@ func (d *Decoder) pump() {
 		d.finish()
 		return
 	}
+	if d.Trace != nil {
+		d.Trace(f.headers[":event-type"], f.payload)
+	}
 	evs, failed := d.frame(f)
 	d.queue = append(d.queue, evs...)
 	if failed != "" {
@@ -182,8 +324,9 @@ func (d *Decoder) finish() {
 		return
 	}
 	u := d.usage
-	if u.Input == 0 && d.pct > 0 && d.window > 0 {
-		u.Input = int(d.pct / 100 * float64(d.window))
+	u.ContextPct = d.pct
+	if !u.Reported && u.Input == 0 && d.pct > 0 && d.window > 0 {
+		u.Input = int(math.Round(d.pct / 100 * float64(d.window)))
 	}
 	if u.Output == 0 {
 		u.Output = (d.said + 3) / 4
@@ -263,26 +406,17 @@ func (d *Decoder) frame(f frame) (evs []Event, failed string) {
 		if s := str("stopReason"); s != "" {
 			d.stop = s
 		}
-		var tu struct {
-			Uncached   int     `json:"uncachedInputTokens"`
-			Input      int     `json:"inputTokens"`
-			Output     int     `json:"outputTokens"`
-			CacheRead  int     `json:"cacheReadInputTokens"`
-			CacheWrite int     `json:"cacheWriteInputTokens"`
-			Pct        float64 `json:"contextUsagePercentage"`
+		if raw, ok := m["tokenUsage"]; ok {
+			d.tokenUsage(raw)
 		}
-		if raw, ok := m["tokenUsage"]; ok && json.Unmarshal(raw, &tu) == nil {
-			in := tu.Uncached
-			if in == 0 {
-				in = tu.Input
-			}
-			d.usage.Input += in
-			d.usage.Output += tu.Output
-			d.usage.CacheRead += tu.CacheRead
-			d.usage.CacheWrite += tu.CacheWrite
-			if tu.Pct > 0 {
-				d.pct = tu.Pct
-			}
+	case "meteringEvent":
+		var credits float64
+		d.usage.MeteringEvents++
+		if u := str("unit"); u != "" {
+			d.usage.MeteringUnit = u
+		}
+		if json.Unmarshal(m["usage"], &credits) == nil && credits > 0 {
+			d.usage.Credits += credits
 		}
 	case "contextUsageEvent":
 		var pct float64

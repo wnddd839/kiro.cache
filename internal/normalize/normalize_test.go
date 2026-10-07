@@ -5,7 +5,7 @@ import (
 	"reflect"
 	"testing"
 
-	"kiro-go/internal/anthropic"
+	"kiro-proxy/internal/anthropic"
 )
 
 func parse(t *testing.T, raw string) *anthropic.Request {

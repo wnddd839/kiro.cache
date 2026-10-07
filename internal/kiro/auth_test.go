@@ -9,8 +9,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -149,27 +152,44 @@ func TestRefreshIDC(t *testing.T) {
 }
 
 func TestRefreshExternalIdP(t *testing.T) {
-	f, c := newFake(t, func(w http.ResponseWriter, _ *http.Request, _ []byte) {
+	var got []recorded
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		got = append(got, recorded{r.Method, r.URL.Path, r.URL.Query(), r.Header.Clone(), body})
 		writeJSON(w, 200, map[string]any{"access_token": "ext-a", "refresh_token": "ext-r", "expires_in": 60})
-	})
-	var srvURL string
-	// TokenURL must point at the fake: borrow it from the runtime override.
-	srvURL = strings.TrimSuffix(c.RuntimeURL(""), "/runtime/")
-	cred := Cred{Method: MethodExternalIdP, RefreshToken: "rt", ClientID: "cid", TokenURL: srvURL + "/idp/token"}
-	got, err := c.Refresh(t.Context(), cred)
+	}))
+	t.Cleanup(srv.Close)
+	c := NewClient(srv.Client())
+	c.IdPHosts = []string{"127.0.0.1"}
+	cred := Cred{Method: MethodExternalIdP, RefreshToken: "rt", ClientID: "cid", ClientSecret: "cs", TokenURL: srv.URL + "/idp/token"}
+	n, err := c.Refresh(t.Context(), cred)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.AccessToken != "ext-a" || got.RefreshToken != "ext-r" {
-		t.Errorf("cred = %+v", got)
+	if n.AccessToken != "ext-a" || n.RefreshToken != "ext-r" {
+		t.Errorf("cred = %+v", n)
 	}
-	r := f.requests()[0]
+	r := got[0]
 	if r.Path != "/idp/token" || r.Header.Get("Content-Type") != "application/x-www-form-urlencoded" {
 		t.Errorf("request = %s %v", r.Path, r.Header)
 	}
 	form, _ := url.ParseQuery(string(r.Body))
-	if form.Get("grant_type") != "refresh_token" || form.Get("client_id") != "cid" || form.Get("refresh_token") != "rt" {
+	if form.Get("grant_type") != "refresh_token" || form.Get("client_id") != "cid" || form.Get("refresh_token") != "rt" || form.Get("client_secret") != "cs" {
 		t.Errorf("form = %v", form)
+	}
+
+	// 不在允许列表 / 非 https：不发请求，凭证判失效
+	for _, u := range []string{"https://evil.example/token", "http://login.microsoftonline.com/x/oauth2/v2.0/token", "https://user:pw@login.microsoftonline.com/t", "https://login.microsoftonline.com.evil.example/t"} {
+		c2 := NewClient(srv.Client())
+		bad := cred
+		bad.TokenURL = u
+		before := len(got)
+		if _, err := c2.Refresh(t.Context(), bad); err == nil || !IsGone(err) || len(got) != before {
+			t.Errorf("%s: err %v (gone %v), requests %d", u, err, IsGone(err), len(got)-before)
+		}
+	}
+	if err := CheckTokenURL("https://login.microsoftonline.com/tenant/oauth2/v2.0/token", nil); err != nil {
+		t.Errorf("entra rejected: %v", err)
 	}
 }
 
@@ -182,9 +202,11 @@ func TestRefreshFailures(t *testing.T) {
 		gone   bool
 		calls  int
 	}{
-		{"401 rejected", 401, map[string]string{"message": "Invalid refresh token"}, Cred{Method: MethodSocial, RefreshToken: "r"}, true, 1},
+		// 只有 400 + invalid_grant 是永久失效；其它 4xx 由号池连续计数
+		{"401 not gone by itself", 401, map[string]string{"message": "Invalid refresh token"}, Cred{Method: MethodSocial, RefreshToken: "r"}, false, 1},
 		{"400 invalid_grant", 400, map[string]string{"error": "invalid_grant"}, Cred{Method: MethodIDC, RefreshToken: "r"}, true, 1},
-		{"403", 403, map[string]string{"message": "no"}, Cred{Method: MethodSocial, RefreshToken: "r"}, true, 1},
+		{"400 other", 400, map[string]string{"error": "invalid_request"}, Cred{Method: MethodSocial, RefreshToken: "r"}, false, 1},
+		{"403 not gone", 403, map[string]string{"message": "no"}, Cred{Method: MethodSocial, RefreshToken: "r"}, false, 1},
 		{"500 is not gone", 500, map[string]string{"message": "boom"}, Cred{Method: MethodSocial, RefreshToken: "r"}, false, 1},
 		{"200 without token", 200, map[string]string{}, Cred{Method: MethodSocial, RefreshToken: "r"}, true, 1},
 		{"no refresh token", 200, nil, Cred{Method: MethodSocial, AccessToken: "a"}, true, 0},
@@ -281,10 +303,12 @@ func TestListModels(t *testing.T) {
 	f, c := newFake(t, func(w http.ResponseWriter, _ *http.Request, _ []byte) {
 		writeJSON(w, 200, map[string]any{
 			"models": []map[string]any{
-				{"modelId": "claude-haiku-4.5", "modelName": "Haiku", "tokenLimits": map[string]int{"maxInputTokens": 200000, "maxOutputTokens": 64000}},
+				{"modelId": "claude-haiku-4.5", "modelName": "Haiku", "tokenLimits": map[string]int{"maxInputTokens": 200000, "maxOutputTokens": 64000},
+					"rateMultiplier": 0.4, "rateUnit": "Credit",
+					"promptCaching": map[string]any{"maximumCacheCheckpointsPerRequest": 4, "minimumTokensPerCacheCheckpoint": 1024, "supportsPromptCaching": true}},
 				{"modelId": ""},
-				{"modelId": "claude-sonnet-4.5", "supportedInputTypes": []string{"TEXT", "image"}},
-				{"modelId": "auto", "modelName": "Auto"},
+				{"modelId": "claude-sonnet-4.5", "supportedInputTypes": []string{"TEXT", "image"}, "rateMultiplier": 1.3},
+				{"modelId": "auto", "modelName": "Auto", "rateMultiplier": 1},
 			},
 			"defaultModel": map[string]string{"modelId": "auto"},
 		})
@@ -295,11 +319,12 @@ func TestListModels(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := []Model{
-		{ID: "auto", Name: "Auto"},
-		{ID: "claude-haiku-4.5", Name: "Haiku", Context: 200000, Output: 64000},
-		{ID: "claude-sonnet-4.5", Name: "claude-sonnet-4.5", Images: true},
+		{ID: "auto", Name: "Auto", Multiplier: 1, Default: true},
+		{ID: "claude-haiku-4.5", Name: "Haiku", Context: 200000, Output: 64000, Multiplier: 0.4, RateUnit: "Credit",
+			PromptCaching: &PromptCaching{Supported: true, MaxCheckpoints: 4, MinTokens: 1024}},
+		{ID: "claude-sonnet-4.5", Name: "claude-sonnet-4.5", Images: true, Multiplier: 1.3},
 	}
-	if fmt.Sprint(got) != fmt.Sprint(want) {
+	if !reflect.DeepEqual(got, want) {
 		t.Errorf("models =\n%+v\nwant\n%+v", got, want)
 	}
 	r := f.requests()[0]
@@ -549,5 +574,136 @@ func TestRefreshHonoursContext(t *testing.T) {
 	_, err := c.Refresh(ctx, Cred{Method: MethodSocial, RefreshToken: "r"})
 	if !errors.Is(err, context.Canceled) || IsGone(err) {
 		t.Errorf("err = %v, want context.Canceled and not gone", err)
+	}
+}
+
+// IdC client 注册过期：标 Reregister，不是 Gone。
+func TestRefreshIdCClientExpired(t *testing.T) {
+	_, c := newFake(t, func(w http.ResponseWriter, _ *http.Request, _ []byte) {
+		writeJSON(w, 400, map[string]string{"error": "invalid_client", "error_description": "client expired"})
+	})
+	cred := Cred{Method: MethodIDC, RefreshToken: "r", ClientID: "c", ClientSecret: "s", ClientSecretExpiresAt: time.Now().Add(-time.Hour)}
+	_, err := c.Refresh(t.Context(), cred)
+	if !IsReregister(err) || IsGone(err) {
+		t.Fatalf("err = %v reregister=%v gone=%v", err, IsReregister(err), IsGone(err))
+	}
+	// 没过期、也不是 invalid_client 的 400：普通失败
+	_, c2 := newFake(t, func(w http.ResponseWriter, _ *http.Request, _ []byte) {
+		writeJSON(w, 400, map[string]string{"error": "slow_down"})
+	})
+	cred.ClientSecretExpiresAt = time.Now().Add(time.Hour)
+	if _, err := c2.Refresh(t.Context(), cred); IsReregister(err) || IsGone(err) {
+		t.Fatalf("plain 400 classified as %v", err)
+	}
+}
+
+// 对话、OIDC 刷新、management 调用用同一套 CLI 身份；机器码取自凭证，固定；版本可配。
+func TestCLIIdentityEverywhere(t *testing.T) {
+	var uas []string
+	f, c := newFake(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
+		uas = append(uas, r.Header.Get("User-Agent")+" | "+r.Header.Get("x-amz-user-agent"))
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/token"):
+			writeJSON(w, 200, map[string]any{"accessToken": "a2", "expiresIn": 60})
+		case strings.HasSuffix(r.URL.Path, "/Get-Usage-Limits"):
+			writeJSON(w, 200, map[string]any{})
+		default:
+			w.WriteHeader(200)
+		}
+	})
+	_ = f
+	c.Identity = Identity{CLIVersion: "9.9.9"}
+	cred := Cred{Method: MethodIDC, AccessToken: "a", RefreshToken: "r", ClientID: "c", ClientSecret: "s", MachineID: "0123456789abcdef0123456789abcdef"}
+	if _, err := c.Refresh(t.Context(), cred); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.UsageLimits(t.Context(), cred); err != nil {
+		t.Fatal(err)
+	}
+	res, err := c.Generate(t.Context(), cred, []byte(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	res, _ = c.Generate(t.Context(), cred, []byte(`{}`))
+	res.Body.Close()
+	want := "aws-sdk-rust/1.0.0 ua/2.1 os/other lang/rust api/codewhispererstreaming#9.9.9 m/E app/AmazonQ-For-CLI md/appVersion-9.9.9-0123456789abcdef0123456789abcdef"
+	if len(uas) != 4 {
+		t.Fatalf("requests %v", uas)
+	}
+	for _, ua := range uas {
+		if ua != want+" | "+want {
+			t.Errorf("ua = %q, want CLI identity with fixed machine id", ua)
+		}
+	}
+}
+
+func TestConnDropped(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		want bool
+	}{
+		{io.EOF, true},
+		{fmt.Errorf("post: %w", io.ErrUnexpectedEOF), true},
+		{&url.Error{Op: "Post", URL: "u", Err: syscall.ECONNRESET}, true},
+		{syscall.EPIPE, true},
+		{errors.New("wsarecv: An existing connection was forcibly closed by the remote host."), true},
+		{errors.New("read tcp: connection reset by peer"), true},
+		{errors.New("dial tcp: connection refused"), false},
+		{context.DeadlineExceeded, false},
+	} {
+		if got := ConnDropped(tc.err); got != tc.want {
+			t.Errorf("ConnDropped(%v) = %v, want %v", tc.err, got, tc.want)
+		}
+	}
+}
+
+func TestNewClientIdleConnTimeout(t *testing.T) {
+	tr, ok := NewClient(nil).HTTP.Transport.(*http.Transport)
+	if !ok || tr.IdleConnTimeout != IdleConnTimeout || tr.Proxy == nil {
+		t.Fatalf("transport = %#v", NewClient(nil).HTTP.Transport)
+	}
+}
+
+// 连接在收到任何响应字节前断开：用新连接重试一次；已收到部分响应再断：不重试（上游可能已处理）。
+func TestGenerateRetriesOnlyBeforeFirstByte(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		partial string // 第一次关连接前写出的字节
+		hits    int64
+		ok      bool
+	}{
+		{"no bytes", "", 2, true},
+		// 状态行已到、头没写完就断：Go 报 unexpected EOF，但上游已经开始回复
+		{"partial header", "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n", 1, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var hits atomic.Int64
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = io.Copy(io.Discard, r.Body)
+				if hits.Add(1) == 1 {
+					conn, buf, err := http.NewResponseController(w).Hijack()
+					if err != nil {
+						t.Error(err)
+						return
+					}
+					_, _ = buf.WriteString(tc.partial)
+					_ = buf.Flush()
+					conn.Close()
+					return
+				}
+				_, _ = io.WriteString(w, "ok")
+			}))
+			defer srv.Close()
+			c := NewClient(srv.Client())
+			c.RuntimeURL = func(string) string { return srv.URL }
+			res, err := c.Generate(t.Context(), Cred{AccessToken: "t"}, []byte(`{}`))
+			if err == nil {
+				res.Body.Close()
+			}
+			if (err == nil) != tc.ok || hits.Load() != tc.hits {
+				t.Fatalf("err %v hits %d, want ok %v hits %d", err, hits.Load(), tc.ok, tc.hits)
+			}
+		})
 	}
 }

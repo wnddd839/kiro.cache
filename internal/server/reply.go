@@ -5,17 +5,47 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
-	"kiro-go/internal/anthropic"
-	"kiro-go/internal/kiro"
+	"kiro-proxy/internal/anthropic"
+	"kiro-proxy/internal/kiro"
+	"kiro-proxy/internal/meter"
+	"kiro-proxy/internal/turn"
 )
 
 const pingEvery = 15 * time.Second
 
+// timingSink 记录首个内容事件时间，用于 TTFT / TPS。
+type timingSink struct {
+	turn.Sink
+	start time.Time
+	first time.Time
+}
+
+func (t *timingSink) mark() {
+	if t.first.IsZero() {
+		t.first = time.Now()
+	}
+}
+
+func (t *timingSink) Text(s string)             { t.mark(); t.Sink.Text(s) }
+func (t *timingSink) Thinking(s string)         { t.mark(); t.Sink.Thinking(s) }
+func (t *timingSink) ToolStart(id, name string) { t.mark(); t.Sink.ToolStart(id, name) }
+
+func (t *timingSink) firstMS() int64 {
+	if t.first.IsZero() {
+		return 0
+	}
+	return t.first.Sub(t.start).Milliseconds()
+}
+
 // reply 是一次回复的结局。ok 与 failure 至多一个为真；都不是表示下游自己走了。
 type reply struct {
-	usage   kiro.Usage
+	// usage 是本地计量。成功时完整；中途失败 / 下游走了时是已消耗的部分：
+	// 上游已开始回复就说明整段输入已处理，再加上已收到的输出与已报的 credits。
+	usage   turn.Usage
+	kiro    kiro.Usage // 上游报的：credits、上下文百分比
 	ok      bool
 	failure *kiro.Failure // 上游中途报错或断流，应记到号上
 }
@@ -27,28 +57,35 @@ func failed(text string) reply {
 
 const brokeOff = "the reply ended before it was complete"
 
-// streamSSE 把解码事件写成 Anthropic SSE。first 是已经读出的第一条事件。
-// 上游中途失败时向下游发 error 事件，并把失败返回给调用方记到号上。
-func streamSSE(ctx context.Context, w http.ResponseWriter, dec *kiro.Decoder, first kiro.Event, msgID, model string) reply {
-	h := w.Header()
-	h.Set("Content-Type", "text/event-stream")
-	h.Set("Cache-Control", "no-cache")
-	h.Set("X-Accel-Buffering", "no")
-	w.WriteHeader(http.StatusOK)
-	rc := http.NewResponseController(w)
+// toolCallTokens 是每个工具调用在输出侧的包装开销。
+const toolCallTokens = 8
 
-	send := func(typ string, data map[string]any) {
-		data["type"] = typ
-		b, _ := json.Marshal(data)
-		fmt.Fprintf(w, "event: %s\ndata: %s\n\n", typ, b)
+// pump 把解码事件写进 sink。first 是已经读出的第一条事件。
+// input 是输入侧用量；settle 给完整用量填费用并记账，在 sink.End 之前调用：
+// 客户端收到结尾时账已记上，紧接着的下一个请求做预算判断能看到它。输出 token 在本地按实际内容计。
+// 上游中途失败时调 sink.Fail 并把失败返回；下游走了则不再写 sink。
+// pumpOpts 是上游报了 tokenUsage 时的口径。
+type pumpOpts struct {
+	hidden int    // Kiro 自带的上下文 token
+	mode   string // kiro.Reported*
+	// reportsSeen 表示上游曾报过 tokenUsage：那时最终输入与本地估算无关，开头的输入只能报 0
+	reportsSeen bool
+}
+
+// startUsage 是流式开头（message_start）报的 usage：每一项都不超过结尾的最终值。
+//   - cache_read / cache_creation 给 0（最终拆分要校准后才知道）；
+//   - input 给本地未缓存输入的下界：校准按上游上下文把各项同比例缩放，比例不低于 0.5（meter.Calibrate），
+//     再留 2 个 token 的舍入余量；上游报过 tokenUsage 时最终输入取上游值，与本地无关，给 0。
+func startUsage(in turn.Usage, reportsSeen bool) turn.Usage {
+	if reportsSeen {
+		return turn.Usage{}
 	}
-	flush := func() { _ = rc.Flush() }
+	return turn.Usage{Input: max(0, in.Input/2-2)}
+}
 
-	send("message_start", map[string]any{"message": map[string]any{
-		"id": msgID, "type": "message", "role": "assistant", "model": model, "content": []any{},
-		"stop_reason": nil, "stop_sequence": nil, "usage": map[string]int{"input_tokens": 0, "output_tokens": 0},
-	}})
-	flush()
+func pump(ctx context.Context, dec *kiro.Decoder, first kiro.Event, sink turn.Sink, input turn.Usage, settle func(turn.Usage, kiro.Usage) turn.Usage, po pumpOpts) reply {
+	// 开头只报保守的下界，最终值以结尾为准。客户端若把 message_start 的 usage 也计入，不会比最终值多
+	sink.Begin(startUsage(input, po.reportsSeen))
 
 	// 上游在长 thinking 时可能很久不出字，定时 ping 防止客户端 / 代理断开
 	events := make(chan kiro.Event)
@@ -71,155 +108,217 @@ func streamSSE(ctx context.Context, w http.ResponseWriter, dec *kiro.Decoder, fi
 	ping := time.NewTicker(pingEvery)
 	defer ping.Stop()
 
-	index, open := -1, ""
-	closeBlock := func() {
-		if open != "" {
-			send("content_block_stop", map[string]any{"index": index})
-			open = ""
+	var out, think strings.Builder
+	tools := 0
+	// measure 是到目前为止的用量：k 是上游报的记账。
+	measure := func(k kiro.Usage) turn.Usage {
+		u := input
+		u.Reasoning = meter.Count(think.String())
+		u.Output = meter.Count(out.String()) + u.Reasoning + tools*toolCallTokens
+		if k.Reported && po.mode != kiro.ReportedIgnore {
+			// 上游报了输入侧真实计数就用它；本地模拟只是 Kiro 不报时的替代。
+			// 上游不分 TTL：1h 按本地拆分的占比搬到上游的 cacheWrite 上
+			in, read := k.Input, k.CacheRead
+			if po.mode != kiro.ReportedRaw {
+				in, read = stripHidden(in, read, po.hidden)
+			}
+			u.Input, u.CacheRead, u.CacheWrite = in, read, k.CacheWrite
+			u.CacheWrite1h = meter.Scale1h(input.CacheWrite1h, input.CacheWrite, k.CacheWrite)
 		}
+		if k.OutputReported && po.mode != kiro.ReportedIgnore {
+			u.Output = max(k.Output, u.Reasoning)
+		}
+		u.Credits = k.Credits
+		return u
 	}
-	begin := func(kind string, block map[string]any) {
-		closeBlock()
-		index++
-		open = kind
-		send("content_block_start", map[string]any{"index": index, "content_block": block})
+	// partial 在没正常结束时取已消耗的量。先等读协程退出：Decoder 不能并发访问。
+	partial := func(r reply) reply {
+		<-readerDone
+		r.usage = measure(dec.Partial())
+		return r
 	}
 	fail := func(text string) reply {
 		r := failed(text)
-		closeBlock()
-		send("error", map[string]any{"error": map[string]any{"type": anthropic.ErrorType(r.failure.Status), "message": r.failure.Message}})
-		flush()
-		return r
+		sink.Fail(r.failure.Status, r.failure.Message)
+		return partial(r)
 	}
 	for {
 		var ev kiro.Event
 		var more bool
 		select {
 		case <-ctx.Done():
-			return reply{}
+			return partial(reply{})
 		case <-ping.C:
-			send("ping", map[string]any{})
-			flush()
+			sink.Ping()
 			continue
 		case ev, more = <-events:
 		}
 		if !more {
 			if ctx.Err() != nil {
-				return reply{}
+				return partial(reply{})
 			}
 			return fail(brokeOff)
 		}
 		switch ev.Kind {
 		case kiro.EvText:
-			if open != "text" {
-				begin("text", map[string]any{"type": "text", "text": ""})
-			}
-			send("content_block_delta", map[string]any{"index": index, "delta": map[string]any{"type": "text_delta", "text": ev.Text}})
+			out.WriteString(ev.Text)
+			sink.Text(ev.Text)
 		case kiro.EvThink:
-			if open != "thinking" {
-				begin("thinking", map[string]any{"type": "thinking", "thinking": "", "signature": ""})
-			}
-			send("content_block_delta", map[string]any{"index": index, "delta": map[string]any{"type": "thinking_delta", "thinking": ev.Text}})
+			think.WriteString(ev.Text)
+			sink.Thinking(ev.Text)
 		case kiro.EvSig:
-			if open == "thinking" {
-				send("content_block_delta", map[string]any{"index": index, "delta": map[string]any{"type": "signature_delta", "signature": ev.Text}})
-			}
+			sink.Signature(ev.Text)
 		case kiro.EvToolStart:
-			begin("tool", map[string]any{"type": "tool_use", "id": ev.ID, "name": ev.Name, "input": map[string]any{}})
+			tools++
+			out.WriteString(ev.Name)
+			sink.ToolStart(ev.ID, ev.Name)
 		case kiro.EvToolArgs:
-			if open == "tool" {
-				send("content_block_delta", map[string]any{"index": index, "delta": map[string]any{"type": "input_json_delta", "partial_json": ev.Text}})
-			}
+			out.WriteString(ev.Text)
+			sink.ToolArgs(ev.Text)
 		case kiro.EvError:
 			return fail(ev.Text)
 		case kiro.EvStop:
-			closeBlock()
-			send("message_delta", map[string]any{
-				"delta": map[string]any{"stop_reason": ev.Stop, "stop_sequence": nil},
-				"usage": usageOf(ev.Usage),
-			})
-			send("message_stop", map[string]any{})
-			flush()
-			return reply{usage: ev.Usage, ok: true}
+			u := settle(measure(ev.Usage), ev.Usage)
+			sink.End(ev.Stop, u)
+			return reply{usage: u, kiro: ev.Usage, ok: true}
 		}
-		flush()
 	}
 }
 
-// collectMessage 把解码事件拼成一条非流式响应。只有收到 EvStop 才算完整；
-// 中途报错或断流一律返回 failure，已收到的半截内容丢弃——不把半句话当成 end_turn 交给客户端。
-func collectMessage(dec *kiro.Decoder, first kiro.Event, msgID, model string) (anthropic.Response, reply) {
-	var blocks []anthropic.ResponseBlock
-	var args []string // 与 blocks 同下标，tool_use 的参数片段
-	last := func() *anthropic.ResponseBlock {
-		if len(blocks) == 0 {
-			return nil
-		}
-		return &blocks[len(blocks)-1]
-	}
-	add := func(b anthropic.ResponseBlock) {
-		blocks = append(blocks, b)
-		args = append(args, "")
-	}
-	finish := func(stop string, u kiro.Usage) anthropic.Response {
-		for i := range blocks {
-			if blocks[i].Type != "tool_use" {
-				continue
-			}
-			blocks[i].Input = json.RawMessage("{}")
-			if json.Valid([]byte(args[i])) && len(args[i]) > 0 {
-				blocks[i].Input = json.RawMessage(args[i])
-			}
-		}
-		if blocks == nil {
-			blocks = []anthropic.ResponseBlock{}
-		}
-		return anthropic.Response{
-			ID: msgID, Type: "message", Role: "assistant", Model: model, Content: blocks,
-			StopReason: stop, Usage: usageOf(u),
-		}
-	}
-
-	ev, err := first, error(nil)
-	for ; err == nil; ev, err = dec.Next() {
-		switch ev.Kind {
-		case kiro.EvText:
-			if b := last(); b != nil && b.Type == "text" {
-				b.Text += ev.Text
-			} else {
-				add(anthropic.ResponseBlock{Type: "text", Text: ev.Text})
-			}
-		case kiro.EvThink:
-			if b := last(); b != nil && b.Type == "thinking" {
-				*b.Thinking += ev.Text
-			} else {
-				t, sig := ev.Text, ""
-				add(anthropic.ResponseBlock{Type: "thinking", Thinking: &t, Signature: &sig})
-			}
-		case kiro.EvSig:
-			if b := last(); b != nil && b.Type == "thinking" {
-				*b.Signature += ev.Text
-			}
-		case kiro.EvToolStart:
-			add(anthropic.ResponseBlock{Type: "tool_use", ID: ev.ID, Name: ev.Name})
-		case kiro.EvToolArgs:
-			if b := last(); b != nil && b.Type == "tool_use" {
-				args[len(args)-1] += ev.Text
-			}
-		case kiro.EvError:
-			return anthropic.Response{}, failed(ev.Text)
-		case kiro.EvStop:
-			return finish(ev.Stop, ev.Usage), reply{usage: ev.Usage, ok: true}
-		}
-	}
-	return anthropic.Response{}, failed(brokeOff)
+// stripHidden 从上游报的输入里扣掉 Kiro 自带的隐藏 token：先扣 uncached，不够再扣 cacheRead，扣到 0 为止。
+// 上游的计数若含 Kiro 自己的 system，原样下发就是把它算到下游头上；确认不含后切 raw 口径。
+func stripHidden(uncached, read, hidden int) (int, int) {
+	d := min(uncached, hidden)
+	uncached -= d
+	hidden -= d
+	read -= min(read, hidden)
+	return uncached, read
 }
 
-func usageOf(u kiro.Usage) anthropic.Usage {
+// anthropicStream 是 Anthropic Messages SSE 的 Sink。
+type anthropicStream struct {
+	w         http.ResponseWriter
+	rc        *http.ResponseController
+	id, model string
+	index     int
+	open      string
+}
+
+func newAnthropicStream(w http.ResponseWriter, id, model string) turn.Sink {
+	return &anthropicStream{w: w, rc: http.NewResponseController(w), id: id, model: model, index: -1}
+}
+
+func (a *anthropicStream) send(typ string, data map[string]any) {
+	data["type"] = typ
+	b, _ := json.Marshal(data)
+	fmt.Fprintf(a.w, "event: %s\ndata: %s\n\n", typ, b)
+	_ = a.rc.Flush()
+}
+
+func (a *anthropicStream) closeBlock() {
+	if a.open != "" {
+		a.send("content_block_stop", map[string]any{"index": a.index})
+		a.open = ""
+	}
+}
+
+func (a *anthropicStream) begin(kind string, block map[string]any) {
+	a.closeBlock()
+	a.index++
+	a.open = kind
+	a.send("content_block_start", map[string]any{"index": a.index, "content_block": block})
+}
+
+func (a *anthropicStream) delta(d map[string]any) {
+	a.send("content_block_delta", map[string]any{"index": a.index, "delta": d})
+}
+
+func (a *anthropicStream) Begin(u turn.Usage) {
+	h := a.w.Header()
+	h.Set("Content-Type", "text/event-stream")
+	h.Set("Cache-Control", "no-cache")
+	h.Set("X-Accel-Buffering", "no")
+	a.w.WriteHeader(http.StatusOK)
+	a.send("message_start", map[string]any{"message": map[string]any{
+		"id": a.id, "type": "message", "role": "assistant", "model": a.model, "content": []any{},
+		"stop_reason": nil, "stop_sequence": nil, "usage": anthropicUsage(u),
+	}})
+}
+
+func (a *anthropicStream) Text(s string) {
+	if a.open != "text" {
+		a.begin("text", map[string]any{"type": "text", "text": ""})
+	}
+	a.delta(map[string]any{"type": "text_delta", "text": s})
+}
+
+func (a *anthropicStream) Thinking(s string) {
+	if a.open != "thinking" {
+		a.begin("thinking", map[string]any{"type": "thinking", "thinking": "", "signature": ""})
+	}
+	a.delta(map[string]any{"type": "thinking_delta", "thinking": s})
+}
+
+func (a *anthropicStream) Signature(s string) {
+	if a.open == "thinking" {
+		a.delta(map[string]any{"type": "signature_delta", "signature": s})
+	}
+}
+
+func (a *anthropicStream) ToolStart(id, name string) {
+	a.begin("tool", map[string]any{"type": "tool_use", "id": id, "name": name, "input": map[string]any{}})
+}
+
+func (a *anthropicStream) ToolArgs(s string) {
+	if a.open == "tool" {
+		a.delta(map[string]any{"type": "input_json_delta", "partial_json": s})
+	}
+}
+
+func (a *anthropicStream) Ping() { a.send("ping", map[string]any{}) }
+
+func (a *anthropicStream) End(stop string, u turn.Usage) {
+	a.closeBlock()
+	// message_delta 的 usage 是累计值，客户端以它为准：输入侧此时已按上游上下文校正过，比 message_start 里的估算准
+	a.send("message_delta", map[string]any{
+		"delta": map[string]any{"stop_reason": stop, "stop_sequence": nil},
+		"usage": anthropicUsage(u),
+	})
+	a.send("message_stop", map[string]any{})
+}
+
+func (a *anthropicStream) Fail(status int, message string) {
+	a.closeBlock()
+	a.send("error", map[string]any{"error": map[string]any{"type": anthropic.ErrorType(status), "message": message}})
+}
+
+// anthropicMessage 是非流式 Messages 响应。
+func anthropicMessage(t *turn.Turn) anthropic.Response {
+	blocks := make([]anthropic.ResponseBlock, 0, len(t.Blocks))
+	for _, b := range t.Blocks {
+		switch b.Kind {
+		case "text":
+			blocks = append(blocks, anthropic.ResponseBlock{Type: "text", Text: b.Text})
+		case "thinking":
+			blocks = append(blocks, anthropic.ResponseBlock{Type: "thinking", Thinking: &b.Text, Signature: &b.Signature})
+		case "tool_use":
+			blocks = append(blocks, anthropic.ResponseBlock{Type: "tool_use", ID: b.ID, Name: b.Name, Input: b.Input})
+		}
+	}
+	return anthropic.Response{
+		ID: t.ID, Type: "message", Role: "assistant", Model: t.Model, Content: blocks,
+		StopReason: t.Stop, Usage: anthropicUsage(t.Usage),
+	}
+}
+
+func anthropicUsage(u turn.Usage) anthropic.Usage {
+	w5 := u.CacheWrite5m()
 	return anthropic.Usage{
 		InputTokens:              u.Input,
 		OutputTokens:             u.Output,
 		CacheReadInputTokens:     u.CacheRead,
 		CacheCreationInputTokens: u.CacheWrite,
+		CacheCreation:            &anthropic.CacheCreation{Ephemeral5m: w5, Ephemeral1h: u.CacheWrite - w5},
+		Credits:                  u.Credits,
 	}
 }

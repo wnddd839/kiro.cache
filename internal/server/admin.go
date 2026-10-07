@@ -6,8 +6,8 @@ import (
 	"net/http"
 	"strings"
 
-	"kiro-go/internal/kiro"
-	"kiro-go/internal/pool"
+	"kiro-proxy/internal/kiro"
+	"kiro-proxy/internal/pool"
 )
 
 // adminMux 是号池管理接口。响应里不含 token。
@@ -19,6 +19,12 @@ import (
 //	POST   /admin/accounts/{id}/disable    停用
 //	POST   /admin/accounts/{id}/refresh    强刷 token 并拉额度
 //	GET    /admin/stats                    全池累计
+//	GET    /admin/overview                 管理台首页汇总
+//	GET    /admin/requests?limit=N         最近请求（每次上游尝试一条）
+//	GET    /admin/models                   模型目录；POST /admin/models/refresh 重拉
+//	GET|POST|DELETE /admin/login           浏览器登录：状态 / 发起 / 取消
+//
+// key、用量、账单、批量操作见 billingRoutes。
 func (s *Server) adminMux() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /admin/accounts", func(w http.ResponseWriter, r *http.Request) {
@@ -36,6 +42,15 @@ func (s *Server) adminMux() *http.ServeMux {
 	mux.HandleFunc("GET /admin/stats", func(w http.ResponseWriter, r *http.Request) {
 		t := s.pool.Totals()
 		writeJSON(w, http.StatusOK, map[string]any{"totals": t, "cache_hit_rate": t.HitRate(), "accounts": s.pool.Len()})
+	})
+	mux.HandleFunc("GET /admin/overview", s.overview)
+	mux.HandleFunc("GET /admin/requests", s.recentRequests)
+	mux.HandleFunc("GET /admin/models", s.adminModels)
+	mux.HandleFunc("POST /admin/models/refresh", s.adminModels)
+	mux.HandleFunc("/admin/login", s.adminLogin)
+	s.billingRoutes(mux)
+	mux.HandleFunc("/admin/", func(w http.ResponseWriter, r *http.Request) {
+		writeError(w, http.StatusNotFound, "no admin route for "+r.Method+" "+r.URL.Path)
 	})
 	return mux
 }
@@ -67,6 +82,13 @@ func (s *Server) addAccount(w http.ResponseWriter, r *http.Request) {
 			var err error
 			if p, err = kiro.IDETokenPath(); err != nil {
 				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+		} else {
+			// 这个路径之后会被读、刷新 token 时还会被写回：只接受 IDE token 文件，不接受任意文件
+			var err error
+			if p, err = kiro.CheckIDEPath(p); err != nil {
+				writeError(w, http.StatusBadRequest, err.Error())
 				return
 			}
 		}

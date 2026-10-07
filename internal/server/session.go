@@ -1,13 +1,14 @@
 package server
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
-	"hash/maphash"
 	"slices"
 	"sync"
 	"time"
 
-	"kiro-go/internal/anthropic"
+	"kiro-proxy/internal/anthropic"
 )
 
 const maxSessions = 4096
@@ -61,21 +62,68 @@ func (t *ttlMap[V]) set(key string, v V) {
 	t.m[key] = ttlEntry[V]{v: v, until: now.Add(t.ttl)}
 }
 
+// snapshotTTL 是 ttlMap 的落盘条目。
+type snapshotTTL[V any] struct {
+	V     V         `json:"v"`
+	Until time.Time `json:"until"`
+}
+
+// dump 是仍有效的条目。
+func (t *ttlMap[V]) dump() map[string]snapshotTTL[V] {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	now := time.Now()
+	out := make(map[string]snapshotTTL[V], len(t.m))
+	for k, e := range t.m {
+		if now.Before(e.until) {
+			out[k] = snapshotTTL[V]{V: e.v, Until: e.until}
+		}
+	}
+	return out
+}
+
+// restore 载入条目，跳过已过期的；不覆盖已有的。
+func (t *ttlMap[V]) restore(in map[string]snapshotTTL[V]) int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	now, n := time.Now(), 0
+	for k, e := range in {
+		if _, ok := t.m[k]; ok || !now.Before(e.Until) || len(t.m) >= maxSessions {
+			continue
+		}
+		t.m[k] = ttlEntry[V]{v: e.V, until: e.Until}
+		n++
+	}
+	return n
+}
+
 func (t *ttlMap[V]) delete(key string) {
 	t.mu.Lock()
 	delete(t.m, key)
 	t.mu.Unlock()
 }
 
-// 一个进程内固定的种子：指纹只在进程内比较。
-var lineageSeed = maphash.MakeSeed()
-
-// lineage 是每条消息的指纹。解析后的 Block 已丢掉 cache_control 等易变字段。
+// lineage 是每条消息的指纹。cache_control 断点每轮都会挪位置，不属于内容，剔掉再算。
+// 用 sha256 截断（不是进程内随机种子的 maphash）：指纹要落盘，重启后仍能判断历史是否延续。
 func lineage(req *anthropic.Request) []uint64 {
 	out := make([]uint64, 0, len(req.Messages))
 	for _, m := range req.Messages {
+		m.Content = withoutCacheControl(m.Content)
 		b, _ := json.Marshal(m)
-		out = append(out, maphash.Bytes(lineageSeed, b))
+		sum := sha256.Sum256(b)
+		out = append(out, binary.LittleEndian.Uint64(sum[:8]))
+	}
+	return out
+}
+
+func withoutCacheControl(c anthropic.Content) anthropic.Content {
+	out := make(anthropic.Content, len(c))
+	for i, b := range c {
+		b.CacheControl = nil
+		if len(b.Content) > 0 {
+			b.Content = withoutCacheControl(b.Content)
+		}
+		out[i] = b
 	}
 	return out
 }

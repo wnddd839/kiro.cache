@@ -12,7 +12,7 @@ import (
 	"regexp"
 	"strings"
 
-	"kiro-go/internal/anthropic"
+	"kiro-proxy/internal/anthropic"
 )
 
 const (
@@ -32,11 +32,17 @@ type entry struct {
 }
 
 type userMsg struct {
-	Content string   `json:"content"`
-	ModelID string   `json:"modelId"`
-	Origin  string   `json:"origin"`
-	Images  []image  `json:"images,omitzero"`
-	Context *userCtx `json:"userInputMessageContext,omitzero"`
+	Content    string      `json:"content"`
+	ModelID    string      `json:"modelId"`
+	Origin     string      `json:"origin"`
+	Images     []image     `json:"images,omitzero"`
+	Context    *userCtx    `json:"userInputMessageContext,omitzero"`
+	CachePoint *cachePoint `json:"cachePoint,omitzero"`
+}
+
+// cachePoint 是 Kiro 的显式缓存断点。SDK（@aws/codewhisperer-streaming-client）里只有 type="default"，没有 TTL。
+type cachePoint struct {
+	Type string `json:"type"`
 }
 
 type userCtx struct {
@@ -53,8 +59,10 @@ type imageSource struct {
 	Bytes string `json:"bytes"`
 }
 
+// tool 是 tools 数组的一项：工具声明，或一个 cachePoint 成员（SDK 的 Tool 联合类型）。
 type tool struct {
-	Spec toolSpec `json:"toolSpecification"`
+	Spec       *toolSpec   `json:"toolSpecification,omitzero"`
+	CachePoint *cachePoint `json:"cachePoint,omitzero"`
 }
 
 type toolSpec struct {
@@ -78,8 +86,9 @@ type toolResult struct {
 }
 
 type asstMsg struct {
-	Content  string    `json:"content"`
-	ToolUses []toolUse `json:"toolUses,omitzero"`
+	Content    string      `json:"content"`
+	ToolUses   []toolUse   `json:"toolUses,omitzero"`
+	CachePoint *cachePoint `json:"cachePoint,omitzero"`
 }
 
 type toolUse struct {
@@ -89,11 +98,13 @@ type toolUse struct {
 }
 
 type conversationState struct {
-	ChatTriggerType string         `json:"chatTriggerType"`
-	AgentTaskType   string         `json:"agentTaskType"`
-	ConversationID  string         `json:"conversationId"`
-	CurrentMessage  currentMessage `json:"currentMessage"`
-	History         []entry        `json:"history,omitzero"`
+	ChatTriggerType string `json:"chatTriggerType"`
+	AgentTaskType   string `json:"agentTaskType"`
+	ConversationID  string `json:"conversationId"`
+	// AgentContinuationID 只在探测里发（BuildOptions.AgentContinuation）；主流程默认不发
+	AgentContinuationID string         `json:"agentContinuationId,omitzero"`
+	CurrentMessage      currentMessage `json:"currentMessage"`
+	History             []entry        `json:"history,omitzero"`
 }
 
 type currentMessage struct {
@@ -112,7 +123,22 @@ type BuildOptions struct {
 	ProfileArn     string
 	ConversationID string // 稳定的上游会话 ID；空则每次随机
 	ThinkingBudget int    // >0 时在首条消息前加 thinking 标签
+	// AgentContinuation 是探测开关：发一个由 conversationId 用 sha256 派生的固定 agentContinuationId。
+	// 主流程不设置，效果未知。
+	AgentContinuation bool
+	// CachePoints 是实验开关（默认关）：在这些位置发 cachePoint{type:"default"}。有没有用由探测决定。
+	CachePoints CachePoints
 }
+
+// CachePoints 是显式 cachePoint 的位置。Kiro 没有单独的 system 字段，system 并在首条 user 里。
+type CachePoints struct {
+	FirstUser bool // 首条 user（含 system）
+	Assistant bool // 历史里最后一条 assistant
+	Tools     bool // tools 数组末尾
+}
+
+// Any 报告是否开了任何一个位置。
+func (c CachePoints) Any() bool { return c.FirstUser || c.Assistant || c.Tools }
 
 // Build 把 Messages 请求转成 generateAssistantResponse 的 body。
 // 返回的 names 是「改写后工具名 → 原名」，解码时还原。
@@ -131,10 +157,24 @@ func Build(req *anthropic.Request, opts BuildOptions) (payload []byte, names map
 
 	current := entries[len(entries)-1].User
 	if tools := buildTools(req, entries); len(tools) > 0 {
+		if opts.CachePoints.Tools {
+			tools = append(tools, tool{CachePoint: &cachePoint{Type: "default"}})
+		}
 		if current.Context == nil {
 			current.Context = &userCtx{}
 		}
 		current.Context.Tools = tools
+	}
+	if opts.CachePoints.FirstUser && len(entries) > 1 {
+		entries[0].User.CachePoint = &cachePoint{Type: "default"}
+	}
+	if opts.CachePoints.Assistant {
+		for i := len(entries) - 2; i >= 0; i-- {
+			if entries[i].Asst != nil {
+				entries[i].Asst.CachePoint = &cachePoint{Type: "default"}
+				break
+			}
+		}
 	}
 
 	convID := opts.ConversationID
@@ -151,11 +191,23 @@ func Build(req *anthropic.Request, opts BuildOptions) (payload []byte, names map
 		AgentMode:  "vibe",
 		ProfileArn: opts.ProfileArn,
 	}
+	if opts.AgentContinuation {
+		out.State.AgentContinuationID = ContinuationID(convID)
+	}
 	if len(entries) > 1 {
 		out.State.History = entries[:len(entries)-1]
 	}
 	payload, err = json.Marshal(out)
 	return payload, toolNames(req), err
+}
+
+// ContinuationID 是从 conversationId 派生的固定 agentContinuationId（UUID 形状）。
+func ContinuationID(convID string) string {
+	sum := sha256.Sum256([]byte("agent-continuation:" + convID))
+	b := sum[:16]
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
 func buildEntries(req *anthropic.Request, model string) []entry {
@@ -339,7 +391,7 @@ func buildTools(req *anthropic.Request, entries []entry) []tool {
 		if s := bytes.TrimSpace(schema); len(s) == 0 || string(s) == "null" {
 			schema = emptySchema
 		}
-		tools = append(tools, tool{Spec: toolSpec{Name: name, Description: desc, InputSchema: inputSchema{JSON: schema}}})
+		tools = append(tools, tool{Spec: &toolSpec{Name: name, Description: desc, InputSchema: inputSchema{JSON: schema}}})
 	}
 	for _, e := range entries {
 		if e.Asst == nil {
@@ -348,7 +400,7 @@ func buildTools(req *anthropic.Request, entries []entry) []tool {
 		for _, c := range e.Asst.ToolUses {
 			if !offered[c.Name] {
 				offered[c.Name] = true
-				tools = append(tools, tool{Spec: toolSpec{Name: c.Name, Description: "Tool", InputSchema: inputSchema{JSON: emptySchema}}})
+				tools = append(tools, tool{Spec: &toolSpec{Name: c.Name, Description: "Tool", InputSchema: inputSchema{JSON: emptySchema}}})
 			}
 		}
 	}

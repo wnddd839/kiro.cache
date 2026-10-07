@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	"kiro-go/internal/anthropic"
+	"kiro-proxy/internal/anthropic"
 )
 
 // Thinks 报告模型是否支持 Kiro 的 prompt 式 thinking：Claude 系与 auto。

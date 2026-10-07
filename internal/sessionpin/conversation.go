@@ -93,6 +93,60 @@ func (t *ConversationTable) ForgetAccount(key, accountID string) {
 	t.mu.Unlock()
 }
 
+// ConvSnapshot 是一个 conversationId 的落盘条目。
+type ConvSnapshot struct {
+	ID    string    `json:"id"`
+	Until time.Time `json:"until"`
+}
+
+// Dump 是仍有效的 会话 → 号 → conversationId。
+func (t *ConversationTable) Dump() map[string]map[string]ConvSnapshot {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	now := time.Now()
+	out := make(map[string]map[string]ConvSnapshot, len(t.m))
+	for k, byAccount := range t.m {
+		for acc, c := range byAccount {
+			if !now.Before(c.until) {
+				continue
+			}
+			if out[k] == nil {
+				out[k] = map[string]ConvSnapshot{}
+			}
+			out[k][acc] = ConvSnapshot{ID: c.id, Until: c.until}
+		}
+	}
+	return out
+}
+
+// Restore 载入 conversationId，跳过过期的与已有的。返回载入条数。
+func (t *ConversationTable) Restore(in map[string]map[string]ConvSnapshot) int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	now, n := time.Now(), 0
+	for k, byAccount := range in {
+		for acc, c := range byAccount {
+			if c.ID == "" || !now.Before(c.Until) {
+				continue
+			}
+			m := t.m[k]
+			if m == nil {
+				if len(t.m) >= maxEntries {
+					continue
+				}
+				m = map[string]conversation{}
+				t.m[k] = m
+			}
+			if _, ok := m[acc]; ok {
+				continue
+			}
+			m[acc] = conversation{id: c.ID, until: c.Until}
+			n++
+		}
+	}
+	return n
+}
+
 // lastUsed 是会话在任一号上最近一次的过期时刻。
 func lastUsed(byAccount map[string]conversation) time.Time {
 	var latest time.Time

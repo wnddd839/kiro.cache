@@ -1,8 +1,10 @@
 package kiro
 
 import (
+	"net/http"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestClassify(t *testing.T) {
@@ -20,9 +22,17 @@ func TestClassify(t *testing.T) {
 		{"usage limit", 402, `{"message":"You have reached the limit","reason":"USAGE_LIMIT"}`, 429, ClassQuota, "usage limit reached: "},
 		{"monthly count", 429, `MONTHLY_REQUEST_COUNT exceeded`, 429, ClassQuota, "usage limit reached: MONTHLY_REQUEST_COUNT"},
 		{"401", 401, `{"message":"The bearer token included in the request is invalid."}`, 401, ClassAuth, "bearer token"},
-		{"403", 403, `{"message":"forbidden"}`, 403, ClassAuth, "forbidden"},
+		{"403 token", 403, `{"message":"The bearer token included in the request is invalid."}`, 403, ClassAuth, "bearer token"},
+		{"403 expired", 403, `{"__type":"ExpiredTokenException","message":"expired"}`, 403, ClassAuth, "expired"},
+		{"403 other", 403, `{"message":"forbidden"}`, 403, ClassForbidden, "forbidden"},
+		{"403 html", 403, `<html>Request blocked</html>`, 403, ClassForbidden, "blocked"},
 		{"429 plain", 429, `{"message":"Too many requests, please wait"}`, 429, ClassThrottle, "Too many requests"},
 		{"429 quota words", 429, `{"message":"monthly quota exhausted"}`, 429, ClassQuota, "monthly quota"},
+		{"429 rate exceeded", 429, `{"message":"Rate exceeded"}`, 429, ClassThrottle, "Rate exceeded"},
+		{"429 rate exceeded plain", 429, `Rate exceeded`, 429, ClassThrottle, "Rate exceeded"},
+		{"429 throttling exception", 429, `{"__type":"ThrottlingException","message":"Rate exceeded"}`, 429, ClassThrottle, "Rate exceeded"},
+		{"429 too many requests", 429, `Too many requests`, 429, ClassThrottle, "Too many requests"},
+		{"429 reached the limit", 429, `{"message":"You have reached the limit."}`, 429, ClassQuota, "reached the limit"},
 		{"throttling at 400", 400, `{"message":"ThrottlingException: slow down"}`, 429, ClassThrottle, "Throttling"},
 		{"throttled plain at 400", 400, `{"message":"request throttled"}`, 429, ClassThrottle, "throttled"},
 		{"500", 500, `{"message":"internal"}`, 500, ClassTransient, "internal"},
@@ -88,5 +98,44 @@ func TestErrorMessage(t *testing.T) {
 		if got := errorMessage(tt.status, []byte(tt.body)); got != tt.want {
 			t.Errorf("errorMessage(%d, %q) = %q, want %q", tt.status, tt.body, got, tt.want)
 		}
+	}
+}
+
+func TestBannedAndRetryAfter(t *testing.T) {
+	for _, tc := range []struct {
+		status int
+		body   string
+		ban    bool
+	}{
+		{403, `{"message":"Your account is TemporarilySuspended"}`, true},
+		{403, `{"message":"temporarily is suspended due to violation of terms"}`, true},
+		{423, `locked`, true},
+		{403, `{"message":"The bearer token is expired"}`, false},
+		{429, `{"message":"temporarily suspended"}`, false},
+	} {
+		if got := Banned(tc.status, []byte(tc.body)); got != tc.ban {
+			t.Errorf("Banned(%d, %s) = %v", tc.status, tc.body, got)
+		}
+		if tc.ban {
+			if f := Classify(tc.status, []byte(tc.body)); f.Class != ClassBanned {
+				t.Errorf("Classify(%d) class %d", tc.status, f.Class)
+			}
+		}
+	}
+	if f := Classify(402, []byte(`{"message":"Payment required"}`)); f.Class != ClassQuota {
+		t.Errorf("402 class %d", f.Class)
+	}
+	h := http.Header{}
+	h.Set("x-amzn-kiro-ratelimit-retry-after", "2500")
+	if d := RetryAfter(h); d != 2500*time.Millisecond {
+		t.Errorf("retry-after ms = %v", d)
+	}
+	h.Set("x-amzn-kiro-ratelimit-retry-after", "9999999")
+	if d := RetryAfter(h); d != maxRetryAfter {
+		t.Errorf("cap = %v", d)
+	}
+	h = http.Header{"Retry-After": {"3"}}
+	if d := RetryAfter(h); d != 3*time.Second {
+		t.Errorf("Retry-After = %v", d)
 	}
 }

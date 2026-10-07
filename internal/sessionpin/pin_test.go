@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"kiro-go/internal/sessionpin"
+	"kiro-proxy/internal/sessionpin"
 )
 
 func TestKeyPrefersSessionHeader(t *testing.T) {

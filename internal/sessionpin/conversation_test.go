@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"kiro-go/internal/sessionpin"
+	"kiro-proxy/internal/sessionpin"
 )
 
 func TestConversationIDStableWithinTTL(t *testing.T) {

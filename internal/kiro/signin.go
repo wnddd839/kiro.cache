@@ -62,6 +62,7 @@ type Login struct {
 
 type awsSignIn struct {
 	region, clientID, clientSecret, provider, state, verifier string
+	clientExpires                                             time.Time
 }
 
 type signInResult struct {
@@ -135,7 +136,8 @@ func (s *SignIn) Run(ctx context.Context) (Login, error) {
 				return
 			}
 			cred = Cred{Method: MethodIDC, AccessToken: t.AccessToken, RefreshToken: t.RefreshToken, ExpiresAt: expiry(t.ExpiresIn),
-				Region: aws.region, ClientID: aws.clientID, ClientSecret: aws.clientSecret, BuilderID: strings.EqualFold(aws.provider, "BuilderId")}
+				Region: aws.region, ClientID: aws.clientID, ClientSecret: aws.clientSecret, ClientSecretExpiresAt: aws.clientExpires,
+				BuilderID: strings.EqualFold(aws.provider, "BuilderId")}
 		case q.Get("state") != state:
 			// 不是这次登录的：别人的页面，或旧标签页
 			writePage(w, false, "This link isn't from this sign-in", "Start it again.")
@@ -163,6 +165,7 @@ func (s *SignIn) Run(ctx context.Context) (Login, error) {
 				var reg struct {
 					ClientID     string `json:"clientId"`
 					ClientSecret string `json:"clientSecret"`
+					ExpiresAt    int64  `json:"clientSecretExpiresAt"` // Unix 秒
 				}
 				err := signInPost(r.Context(), c, c.OIDCURL(region)+"/client/register", map[string]any{
 					"clientName": "Kiro IDE", "clientType": "public", "scopes": signInScopes,
@@ -176,7 +179,7 @@ func (s *SignIn) Run(ctx context.Context) (Login, error) {
 					fail(err.Error())
 					return
 				}
-				aws = awsSignIn{region: region, clientID: reg.ClientID, clientSecret: reg.ClientSecret,
+				aws = awsSignIn{region: region, clientID: reg.ClientID, clientSecret: reg.ClientSecret, clientExpires: unixOrZero(reg.ExpiresAt),
 					provider: map[string]string{"builderid": "BuilderId", "awsidc": "Enterprise", "internal": "Internal"}[opt],
 					state:    randURL(24), verifier: randURL(48)}
 				a := url.Values{"response_type": {"code"}, "client_id": {aws.clientID}, "redirect_uri": {awsRedirect},
@@ -188,7 +191,7 @@ func (s *SignIn) Run(ctx context.Context) (Login, error) {
 				fail("A company's own identity provider can't be signed in to here yet; sign in with the Kiro IDE and use import-ide")
 				return
 			default:
-				fail(fmt.Sprintf("Kiro's page came back with a sign-in kiro-go doesn't know (%q)", opt))
+				fail(fmt.Sprintf("Kiro's page came back with a sign-in kiro-proxy doesn't know (%q)", opt))
 				return
 			}
 		}
@@ -336,4 +339,12 @@ func OpenBrowser(u string) error {
 	}
 	go cmd.Wait() //nolint:errcheck // 只为回收进程
 	return nil
+}
+
+// unixOrZero 把 Unix 秒转成时间；0 是未知。
+func unixOrZero(sec int64) time.Time {
+	if sec <= 0 {
+		return time.Time{}
+	}
+	return time.Unix(sec, 0)
 }

@@ -9,7 +9,7 @@ import (
 	"sync"
 	"testing"
 
-	"kiro-go/internal/anthropic"
+	"kiro-proxy/internal/anthropic"
 )
 
 var uuidRe = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
@@ -505,5 +505,43 @@ func TestNewUUID(t *testing.T) {
 			t.Fatalf("NewUUID repeated %q", u)
 		}
 		seen[u] = true
+	}
+}
+
+func TestBuildCachePoints(t *testing.T) {
+	req := &anthropic.Request{
+		System: anthropic.Content{{Type: "text", Text: "sys"}},
+		Tools:  []anthropic.Tool{{Name: "read", InputSchema: json.RawMessage(`{"type":"object"}`)}},
+		Messages: []anthropic.Message{
+			{Role: "user", Content: anthropic.Content{{Type: "text", Text: "q1"}}},
+			{Role: "assistant", Content: anthropic.Content{{Type: "text", Text: "a1"}}},
+			{Role: "user", Content: anthropic.Content{{Type: "text", Text: "q2"}}},
+		},
+	}
+	off, _, _ := Build(req, BuildOptions{Model: "m", ConversationID: "c"})
+	if strings.Contains(string(off), "cachePoint") {
+		t.Fatalf("cachePoint sent while off: %s", off)
+	}
+	on, _, _ := Build(req, BuildOptions{Model: "m", ConversationID: "c", CachePoints: CachePoints{FirstUser: true, Assistant: true, Tools: true}})
+	if n := strings.Count(string(on), `"cachePoint":{"type":"default"}`); n != 3 {
+		t.Fatalf("cachePoints = %d in %s", n, on)
+	}
+	var b struct {
+		State struct {
+			Current struct {
+				User struct {
+					Context struct {
+						Tools []map[string]any `json:"tools"`
+					} `json:"userInputMessageContext"`
+				} `json:"userInputMessage"`
+			} `json:"currentMessage"`
+		} `json:"conversationState"`
+	}
+	if err := json.Unmarshal(on, &b); err != nil {
+		t.Fatal(err)
+	}
+	tools := b.State.Current.User.Context.Tools
+	if len(tools) != 2 || tools[1]["cachePoint"] == nil || tools[1]["toolSpecification"] != nil {
+		t.Fatalf("tools = %v", tools)
 	}
 }

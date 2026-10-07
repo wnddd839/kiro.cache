@@ -278,26 +278,29 @@ func TestDecoderUsageAndStop(t *testing.T) {
 				event("metadataEvent", `{"tokenUsage":{"uncachedInputTokens":100,"inputTokens":999,"outputTokens":20,"cacheReadInputTokens":3000,"cacheWriteInputTokens":400}}`),
 			},
 			stop:  "end_turn",
-			usage: Usage{Input: 100, Output: 20, CacheRead: 3000, CacheWrite: 400},
+			usage: Usage{Input: 100, Output: 20, CacheRead: 3000, CacheWrite: 400, Reported: true, OutputReported: true},
 		},
 		{
-			name: "inputTokens when no uncached; summed across events",
+			// 多条：取最后一条，不累加；uncached 缺失时 inputTokens − cacheRead − cacheWrite
+			name: "last of several; uncached derived from inputTokens",
 			frames: [][]byte{
 				event("messageMetadataEvent", `{"tokenUsage":{"inputTokens":10,"outputTokens":1}}`),
-				event("metadataEvent", `{"tokenUsage":{"inputTokens":5,"outputTokens":2,"cacheReadInputTokens":7}}`),
+				event("metadataEvent", `{"tokenUsage":{"inputTokens":12,"outputTokens":2,"cacheReadInputTokens":7}}`),
 			},
 			stop:  "end_turn",
-			usage: Usage{Input: 15, Output: 3, CacheRead: 7},
+			usage: Usage{Input: 5, Output: 2, CacheRead: 7, Reported: true, OutputReported: true},
 		},
 		{
-			name: "input estimated from context percentage",
+			name: "input estimated from context percentage; credits summed",
 			frames: [][]byte{
 				event("assistantResponseEvent", `{"content":"12345678"}`),
 				event("contextUsageEvent", `{"contextUsagePercentage":25}`),
+				event("meteringEvent", `{"unit":"credit","unitPlural":"credits","usage":0.25}`),
+				event("meteringEvent", `{"unit":"credit","usage":0.125}`),
 			},
 			window: 200_000,
 			stop:   "end_turn",
-			usage:  Usage{Input: 50_000, Output: 2},
+			usage:  Usage{Input: 50_000, Output: 2, Credits: 0.375, ContextPct: 25},
 		},
 		{
 			name:   "max tokens",
@@ -316,14 +319,36 @@ func TestDecoderUsageAndStop(t *testing.T) {
 				event("metadataEvent", `{"stopReason":"MAX_TOKENS","tokenUsage":{"outputTokens":9}}`),
 			},
 			stop:  "tool_use",
-			usage: Usage{Output: 9},
+			usage: Usage{Output: 9, OutputReported: true}, // 只报输出：输入侧不算上游已报
+		},
+		{
+			name: "output-only tokenUsage keeps context estimate",
+			frames: [][]byte{
+				event("assistantResponseEvent", `{"content":"hi"}`),
+				event("metadataEvent", `{"tokenUsage":{"outputTokens":4,"contextUsagePercentage":10}}`),
+			},
+			window: 200_000,
+			stop:   "end_turn",
+			usage:  Usage{Input: 20_000, Output: 4, ContextPct: 10, OutputReported: true},
+		},
+		{
+			name: "all-cached input is reported, not replaced by context estimate",
+			frames: [][]byte{
+				event("metadataEvent", `{"tokenUsage":{"cacheReadInputTokens":3000,"outputTokens":5,"contextUsagePercentage":10}}`),
+			},
+			window: 200_000,
+			stop:   "end_turn",
+			usage:  Usage{Output: 5, CacheRead: 3000, ContextPct: 10, Reported: true, OutputReported: true},
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			evs := drain(t, NewDecoder(stream(tt.frames...), false, tt.window, nil))
 			last := evs[len(evs)-1]
-			if last.Kind != EvStop || last.Stop != tt.stop || last.Usage != tt.usage {
+			got := last.Usage
+			// 交叉核对用的诊断字段单独测
+			got.UsageEvents, got.MeteringEvents, got.MeteringUnit, got.TotalTokens, got.Normalized, got.UsageRaw = 0, 0, "", 0, 0, nil
+			if last.Kind != EvStop || last.Stop != tt.stop || got != tt.usage {
 				t.Errorf("stop = %+v, want stop %q usage %+v", last, tt.stop, tt.usage)
 			}
 		})
@@ -423,5 +448,43 @@ func TestDecoderThinkingFlushedOnEnd(t *testing.T) {
 	}
 	if got := joined(evs, EvText); got != "" {
 		t.Errorf("text = %q", got)
+	}
+}
+
+func TestDecoderDiagnostics(t *testing.T) {
+	var trace []string
+	d := NewDecoder(stream(
+		event("metadataEvent", `{"tokenUsage":{"uncachedInputTokens":10,"outputTokens":2,"totalTokens":4100,"normalizedTokenUsage":0.75}}`),
+		event("metadataEvent", `{"tokenUsage":{"uncachedInputTokens":10,"outputTokens":3,"totalTokens":4113}}`),
+		event("meteringEvent", `{"unit":"credit","usage":0.1}`),
+	), false, 0, nil)
+	d.Trace = func(ev string, _ []byte) { trace = append(trace, ev) }
+	evs := drain(t, d)
+	u := evs[len(evs)-1].Usage
+	if u.UsageEvents != 2 || u.TotalTokens != 4113 || u.Normalized != 0.75 || u.MeteringEvents != 1 || u.MeteringUnit != "credit" {
+		t.Fatalf("diagnostics = %+v", u)
+	}
+	if len(trace) != 3 || trace[2] != "meteringEvent" {
+		t.Fatalf("trace = %v", trace)
+	}
+}
+
+// 字段缺失与值为 0 区分开：uncached 显式为 0 就是 0（全部命中），不再回落到 inputTokens。
+func TestTokenUsageZeroVsMissing(t *testing.T) {
+	evs := drain(t, NewDecoder(stream(
+		event("metadataEvent", `{"tokenUsage":{"uncachedInputTokens":0,"inputTokens":3000,"cacheReadInputTokens":3000,"outputTokens":4}}`),
+	), false, 0, nil))
+	if u := evs[len(evs)-1].Usage; u.Input != 0 || u.CacheRead != 3000 || !u.Reported {
+		t.Fatalf("explicit zero uncached: %+v", u)
+	}
+	// 多条：原值全部保留
+	evs = drain(t, NewDecoder(stream(
+		event("metadataEvent", `{"tokenUsage":{"uncachedInputTokens":100,"outputTokens":1}}`),
+		event("metadataEvent", `{"tokenUsage":{"uncachedInputTokens":100,"outputTokens":9}}`),
+		event("metadataEvent", `{"tokenUsage":{"uncachedInputTokens":100,"outputTokens":20}}`),
+	), false, 0, nil))
+	u := evs[len(evs)-1].Usage
+	if u.Input != 100 || u.Output != 20 || u.UsageEvents != 3 || u.UsageRaw == nil || len(*u.UsageRaw) != 3 {
+		t.Fatalf("several tokenUsage: %+v raw %v", u, u.UsageRaw)
 	}
 }

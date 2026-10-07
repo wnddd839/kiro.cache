@@ -15,9 +15,14 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      # gofmt 只在一处判定：vet / build / test 双系统跑，格式判定一个环境够了。
+      # 用 bash 数组传文件名，含空格的路径不会被拆开。
       - name: gofmt
         if: runner.os == 'Linux'
-        run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+        run: |
+          mapfile -t files < <(git ls-files -z '*.go' | tr '\0' '\n')
+          out="$(gofmt -l "${files[@]}")"
+          if [ -n "$out" ]; then echo "gofmt needed:"; echo "$out"; exit 1; fi
       - run: go vet ./...
       - run: go build ./...
       - run: go test -race -count=1 ./...

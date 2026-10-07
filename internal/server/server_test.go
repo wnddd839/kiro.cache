@@ -2,6 +2,7 @@ package server
 
 import (
 	"bufio"
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -15,9 +16,9 @@ import (
 	"testing"
 	"time"
 
-	"kiro-go/internal/config"
-	"kiro-go/internal/kiro"
-	"kiro-go/internal/pool"
+	"kiro-proxy/internal/config"
+	"kiro-proxy/internal/kiro"
+	"kiro-proxy/internal/pool"
 )
 
 // fakeKiro 是本地上游：记录每次 generateAssistantResponse 的 token 与 body。
@@ -28,6 +29,13 @@ type fakeKiro struct {
 	reply func(token string) (status int, body string)
 	// stream 非 nil 时替代默认的 200 事件流（用于中途报错 / 断流）
 	stream func(token string) []byte
+	// streamWriter 非 nil 时由它自己写 200 响应体（用于阻塞 / 分段写）
+	streamWriter func(w http.ResponseWriter, r *http.Request)
+	// replyHeader 加在非 200 响应上
+	replyHeader http.Header
+	refreshes   int
+	// hangups 是接下来要直接关连接、不回任何字节的请求数（模拟空闲连接被对端关掉）
+	hangups int
 }
 
 type upstreamCall struct {
@@ -58,6 +66,22 @@ func (f *fakeKiro) tokens() []string {
 func (f *fakeKiro) handler(t *testing.T) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /runtime/{region}/generateAssistantResponse", func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		hangup := f.hangups > 0
+		if hangup {
+			f.hangups--
+		}
+		f.mu.Unlock()
+		if hangup {
+			_, _ = io.Copy(io.Discard, r.Body)
+			conn, _, err := http.NewResponseController(w).Hijack()
+			if err != nil {
+				t.Errorf("hijack: %v", err)
+				return
+			}
+			conn.Close()
+			return
+		}
 		var body map[string]any
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Errorf("upstream body: %v", err)
@@ -71,11 +95,18 @@ func (f *fakeKiro) handler(t *testing.T) http.Handler {
 			status, errBody = f.reply(token)
 		}
 		if status != 200 {
+			for k, v := range f.replyHeader {
+				w.Header()[k] = v
+			}
 			w.WriteHeader(status)
 			io.WriteString(w, errBody)
 			return
 		}
 		w.Header().Set("Content-Type", "application/vnd.amazon.eventstream")
+		if f.streamWriter != nil {
+			f.streamWriter(w, r)
+			return
+		}
 		if f.stream != nil {
 			if b := f.stream(token); b != nil {
 				w.Write(b)
@@ -91,6 +122,17 @@ func (f *fakeKiro) handler(t *testing.T) http.Handler {
 	})
 	mux.HandleFunc("GET /mgmt/{region}/Get-Usage-Limits", func(w http.ResponseWriter, r *http.Request) {
 		io.WriteString(w, `{}`)
+	})
+	// refresh：把 tokN 换成 tokN（同一个号的身份不变，便于断言），记下次数
+	mux.HandleFunc("POST /refresh/{region}/refreshToken", func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		f.refreshes++
+		f.mu.Unlock()
+		var in struct {
+			RefreshToken string `json:"refreshToken"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&in)
+		_ = json.NewEncoder(w).Encode(map[string]any{"accessToken": strings.TrimPrefix(in.RefreshToken, "r-"), "refreshToken": in.RefreshToken, "expiresIn": 3600})
 	})
 	return mux
 }
@@ -115,9 +157,11 @@ func frame(eventType, payload string) []byte {
 }
 
 type harness struct {
-	srv  *httptest.Server
-	up   *fakeKiro
-	pool *pool.Pool
+	srv      *httptest.Server
+	up       *fakeKiro
+	pool     *pool.Pool
+	s        *Server
+	poolPath string
 }
 
 func newHarness(t *testing.T, accounts int, mutate func(*config.Config)) *harness {
@@ -129,15 +173,17 @@ func newHarness(t *testing.T, accounts int, mutate func(*config.Config)) *harnes
 	client := kiro.NewClient(upSrv.Client())
 	client.RuntimeURL = func(r string) string { return upSrv.URL + "/runtime/" + r }
 	client.ManagementURL = func(r string) string { return upSrv.URL + "/mgmt/" + r }
+	client.RefreshURL = func(r string) string { return upSrv.URL + "/refresh/" + r + "/refreshToken" }
 
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	p, err := pool.Open(filepath.Join(t.TempDir(), "accounts.json"), pool.Options{Client: client, Logger: log})
+	poolPath := filepath.Join(t.TempDir(), "accounts.json")
+	p, err := pool.Open(poolPath, pool.Options{Client: client, Logger: log, PinWait: 20 * time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
 	}
 	for i := range accounts {
 		_, err := p.Add(pool.Account{ID: fmt.Sprintf("a%d", i), Cred: kiro.Cred{
-			Method: kiro.MethodSocial, AccessToken: fmt.Sprintf("tok%d", i), RefreshToken: "r",
+			Method: kiro.MethodSocial, AccessToken: fmt.Sprintf("tok%d", i), RefreshToken: fmt.Sprintf("r-tok%d", i),
 			ExpiresAt: time.Now().Add(time.Hour), ProfileArn: "arn:aws:codewhisperer:us-east-1:1:profile/x",
 		}})
 		if err != nil {
@@ -145,16 +191,21 @@ func newHarness(t *testing.T, accounts int, mutate func(*config.Config)) *harnes
 		}
 	}
 	cfg := config.Default()
+	cfg.CacheFile = ""                    // 测试不落盘；落盘由 meter 的测试覆盖
+	cfg.PriceSync, cfg.PricesFile = 0, "" // 不拉在线价格
 	if mutate != nil {
 		mutate(&cfg)
 	}
-	s, err := New(t.Context(), cfg, p, log)
+	bg, stop := context.WithCancel(context.Background())
+	s, err := New(bg, cfg, p, log, Stores{})
 	if err != nil {
+		stop()
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { stop(); s.Wait() }) // 先停后台落盘，再让 TempDir 清理
 	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
-	return &harness{srv: srv, up: up, pool: p}
+	return &harness{srv: srv, up: up, pool: p, s: s, poolPath: poolPath}
 }
 
 func (h *harness) post(t *testing.T, path, body string, header map[string]string) *http.Response {
@@ -181,7 +232,8 @@ const turn2 = `{"model":"claude-sonnet-4-5-20250929","max_tokens":100,
 "messages":[{"role":"user","content":"fix the bug"},{"role":"assistant","content":"ok"},{"role":"user","content":"and tests"}]}`
 
 func TestNonStreamResponseAndUsage(t *testing.T) {
-	h := newHarness(t, 1, nil)
+	// 桩上游报了 tokenUsage：raw 口径原样用（默认 conservative 会扣隐藏 token，见 TestReportedConservative）
+	h := newHarness(t, 1, func(c *config.Config) { c.ReportedUsage = kiro.ReportedRaw })
 	res := h.post(t, "/v1/messages", fmt.Sprintf(turn1, "aaa"), nil)
 	if res.StatusCode != 200 {
 		b, _ := io.ReadAll(res.Body)
@@ -189,7 +241,7 @@ func TestNonStreamResponseAndUsage(t *testing.T) {
 	}
 	var msg struct {
 		Content []struct{ Type, Text string }
-		Usage   map[string]int
+		Usage   map[string]any
 		Model   string
 	}
 	if err := json.NewDecoder(res.Body).Decode(&msg); err != nil {
@@ -198,8 +250,13 @@ func TestNonStreamResponseAndUsage(t *testing.T) {
 	if len(msg.Content) != 1 || msg.Content[0].Text != "hello world" {
 		t.Fatalf("content = %+v", msg.Content)
 	}
-	if msg.Usage["cache_read_input_tokens"] != 900 || msg.Usage["input_tokens"] != 10 {
+	if msg.Usage["cache_read_input_tokens"] != 900.0 || msg.Usage["input_tokens"] != 10.0 {
 		t.Fatalf("usage = %v", msg.Usage)
+	}
+	// cache_creation 与 Anthropic 同形：两项之和 = cache_creation_input_tokens
+	cc, _ := msg.Usage["cache_creation"].(map[string]any)
+	if cc == nil || cc["ephemeral_5m_input_tokens"].(float64)+cc["ephemeral_1h_input_tokens"].(float64) != msg.Usage["cache_creation_input_tokens"] {
+		t.Fatalf("cache_creation = %v", msg.Usage)
 	}
 	if msg.Model != "claude-sonnet-4-5-20250929" {
 		t.Fatalf("model echoed = %q", msg.Model)
@@ -262,17 +319,29 @@ func TestRewrittenHistoryRotatesConversation(t *testing.T) {
 	}
 }
 
+// 新会话在同档的号之间随机分布（不按 LRU 轮转），已有会话始终回到自己的号。
 func TestDifferentSessionsSpreadAcrossAccounts(t *testing.T) {
 	h := newHarness(t, 2, nil)
-	h.post(t, "/v1/messages", fmt.Sprintf(turn1, "a"), map[string]string{"X-Session-Id": "s1"})
-	h.post(t, "/v1/messages", fmt.Sprintf(turn1, "a"), map[string]string{"X-Session-Id": "s2"})
-	h.post(t, "/v1/messages", fmt.Sprintf(turn2, "a"), map[string]string{"X-Session-Id": "s1"})
-	toks := h.up.tokens()
-	if toks[0] == toks[1] {
-		t.Fatalf("idle accounts: new session should go to the least recently used one: %v", toks)
+	first := map[string]string{}
+	for i := range 20 {
+		sid := fmt.Sprint("s", i)
+		h.post(t, "/v1/messages", fmt.Sprintf(turn1, sid), map[string]string{"X-Session-Id": sid})
+		toks := h.up.tokens()
+		first[sid] = toks[len(toks)-1]
 	}
-	if toks[2] != toks[0] {
-		t.Fatalf("session s1 must stick to its account: %v", toks)
+	used := map[string]bool{}
+	for _, tok := range first {
+		used[tok] = true
+	}
+	if len(used) != 2 {
+		t.Fatalf("20 new sessions all went to %v", used)
+	}
+	for sid, tok := range first {
+		h.post(t, "/v1/messages", fmt.Sprintf(turn2, sid), map[string]string{"X-Session-Id": sid})
+		toks := h.up.tokens()
+		if toks[len(toks)-1] != tok {
+			t.Fatalf("session %s moved from %s to %s", sid, tok, toks[len(toks)-1])
+		}
 	}
 }
 
@@ -332,7 +401,7 @@ func TestAllAccountsCoolingReturns429(t *testing.T) {
 }
 
 func TestStreamSSE(t *testing.T) {
-	h := newHarness(t, 1, nil)
+	h := newHarness(t, 1, func(c *config.Config) { c.ReportedUsage = kiro.ReportedRaw })
 	body := strings.Replace(fmt.Sprintf(turn1, "a"), `"max_tokens":100`, `"max_tokens":100,"stream":true`, 1)
 	res := h.post(t, "/v1/messages", body, nil)
 	if ct := res.Header.Get("Content-Type"); ct != "text/event-stream" {

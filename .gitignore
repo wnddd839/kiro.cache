@@ -9,6 +9,13 @@ bin/
 .cache/
 accounts.json
 accounts.jsonl
+keys.json
+usage.jsonl
+usage.jsonl.*
+promptcache.json
 dist/
+kiro-proxy.json
 kiro-go.json
 *.sqlite3
+prices.json
+*.sessions.json
