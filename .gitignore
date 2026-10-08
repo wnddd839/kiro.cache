@@ -1,21 +1,27 @@
+# 构建产物
 bin/
+dist/
+releases/
 *.exe
 *.exe~
 *.test
 *.out
-.env
-*.log
-.DS_Store
-.cache/
+
+# 运行时数据（含凭证 / 账本，绝不入库）
 accounts.json
 accounts.jsonl
 keys.json
 usage.jsonl
 usage.jsonl.*
 promptcache.json
-dist/
+*.sessions.json
+prices.json
 kiro-proxy.json
 kiro-go.json
 *.sqlite3
-prices.json
-*.sessions.json
+.env
+
+# 本地
+.cache/
+*.log
+.DS_Store

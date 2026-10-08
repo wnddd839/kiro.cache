@@ -9,7 +9,7 @@ ifeq ($(strip $(GOFILES)),)
 GOFILES := .
 endif
 
-.PHONY: build test check fmt lint release clean
+.PHONY: build test check fmt lint release release-checksums clean
 
 build:
 	go build -trimpath -ldflags "$(LDFLAGS)" -o bin/kiro-proxy$(EXT) ./cmd/kiro-proxy
@@ -37,11 +37,15 @@ endif
 lint:
 	go vet ./...
 
-# 交叉编译到 dist/
+# 交叉编译到 releases/，并生成校验和。
 release:
-	GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "$(LDFLAGS)" -o dist/kiro-proxy-windows-amd64.exe ./cmd/kiro-proxy
-	GOOS=linux   GOARCH=amd64 go build -trimpath -ldflags "$(LDFLAGS)" -o dist/kiro-proxy-linux-amd64 ./cmd/kiro-proxy
-	GOOS=darwin  GOARCH=arm64 go build -trimpath -ldflags "$(LDFLAGS)" -o dist/kiro-proxy-darwin-arm64 ./cmd/kiro-proxy
+	GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "$(LDFLAGS)" -o releases/kiro-proxy-windows-amd64.exe ./cmd/kiro-proxy
+	GOOS=linux   GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "$(LDFLAGS)" -o releases/kiro-proxy-linux-amd64 ./cmd/kiro-proxy
+	GOOS=darwin  GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags "$(LDFLAGS)" -o releases/kiro-proxy-darwin-arm64 ./cmd/kiro-proxy
+	$(MAKE) release-checksums
+
+release-checksums:
+	@cd releases && (sha256sum kiro-proxy-* 2>/dev/null || shasum -a 256 kiro-proxy-*) > SHA256SUMS.txt
 
 clean:
-	rm -rf bin dist
+	rm -rf bin dist releases

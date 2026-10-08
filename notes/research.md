@@ -27,7 +27,7 @@
 
 Magpie 用 `plugin-auth.json` 的 `id` / `id#slot` + `logins.json` 把多账号补在插件外面（`plugin_accounts.go`）。
 
-本机当前：`plugins.json` 装了 `@magpie-community/opencode-kiro-auth@latest`，`plugin-auth.json` 里只有一条 `kiro`，且是 `source: "kiro"` 标记（读 kiro-cli / IDE，不拷 token）。`logins.json` 里这条被 `hidden`。
+实测时：`plugins.json` 装了 `@magpie-community/opencode-kiro-auth@latest`，`plugin-auth.json` 里只有一条 `kiro`，且是 `source: "kiro"` 标记（读 kiro-cli / IDE，不拷 token）。`logins.json` 里这条被 `hidden`。
 
 ---
 
@@ -35,7 +35,7 @@ Magpie 用 `plugin-auth.json` 的 `id` / `id#slot` + `logins.json` 把多账号�
 
 ### Magpie 内置（`kiro_accounts.go`）
 
-- kiro-cli / IDE：**只读，各一个号**。cli 在 `%APPDATA%/kiro-cli/data.sqlite3` 的 `auth_kv`；IDE 在 `~/.aws/sso/cache/kiro-auth-token.json`。
+- kiro-cli / IDE：**只读，各一个号**。cli 在 kiro-cli 的本地 SQLite `auth_kv`；IDE 在 `~/.aws/sso/cache/kiro-auth-token.json`。
 - Magpie 自己登录的号：每个号一个 home，`~/.config/magpie/kiro/<id>/kiro-auth-token.json`。refresh token 只写回自己的 home，互不抢。
 - `logins.json` 记顺序、开关、隐藏。CLI/IDE 那个号没有 home，只能藏，不能删凭证。
 - 有 provider key（`ksk_…`）时，**只用这个 key，其它号全部不用**。
@@ -76,7 +76,7 @@ Magpie 用 `plugin-auth.json` 的 `id` / `id#slot` + `logins.json` 把多账号�
 
 路由组还有 `smart/order/rotate/usage`。Kiro 多号时 Magpie 已经能把多个 plugin 账号当成候选。
 
-本机 affinity 里目前只有 Cursor，没有 Kiro 记录。
+实测时 affinity 里还没有 Kiro 记录。
 
 ### 2. Token / 模型列表的进程内缓存
 
@@ -146,7 +146,7 @@ conversationState.currentMessage = 最后一条 user
 ```
 客户端 /v1/messages
         ↓
-   kiro-go dispatcher
+   kiro-proxy dispatcher
         ↓ 选号（粘滞优先，其次额度）
    插件协议 或 直接 runtime.kiro.dev
 ```
@@ -168,9 +168,7 @@ conversationState.currentMessage = 最后一条 user
 
 ---
 
-## 本机现状
+## 实测环境
 
-- Magpie 已装 Kiro 插件，但当前 Kiro 登录是 CLI/IDE 标记，且在 magpie 里被 hidden
-- IDE token 文件存在：`%USERPROFILE%\.aws\sso\cache\kiro-auth-token.json`
-- `~/kiro-accounts` 空；`~/kiro-proxy` 之前也空，现在是本项目
+- Magpie 已装 Kiro 插件，但 Kiro 登录是 CLI/IDE 标记，且在 magpie 里被 hidden
 - 还没有可用号池。下一步才是找号、落 accounts、打一条请求看 `cacheRead`
