@@ -3,15 +3,15 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>kiro-proxy — 把 Kiro 账号池变成 /v1</title>
-  <meta name="description" content="kiro-proxy：本地 Kiro 反代 + 自有号池分发。对下游说 Anthropic Messages / OpenAI Chat Completions / OpenAI Responses，对上游说 Kiro。会话粘号、稳定 conversationId，把上游 prompt cache 命中率打上去。" />
-  <meta property="og:title" content="kiro-proxy" />
-  <meta property="og:description" content="把 Kiro 账号池变成任何 Anthropic / OpenAI 客户端都能直连的本地网关。" />
+  <title>kiro.cache — 让每一次使用都有迹可循</title>
+  <meta name="description" content="kiro.cache：围绕 Kiro 会话、缓存与用量的本地工具。集中查看账号、客户端接入与预算记录，让日常使用更有条理。" />
+  <meta property="og:title" content="kiro.cache" />
+  <meta property="og:description" content="会话、缓存、用量与预算，一处查看。" />
   <meta property="og:type" content="website" />
-  <meta property="og:url" content="https://wnddd839.github.io/kiro-proxy/" />
-  <meta property="og:image" content="https://wnddd839.github.io/kiro-proxy/logo.svg" />
+  <meta property="og:url" content="https://wnddd839.github.io/kiro.cache/" />
+  <meta property="og:image" content="https://wnddd839.github.io/kiro.cache/logo.svg" />
   <meta name="twitter:card" content="summary" />
-  <link rel="canonical" href="https://wnddd839.github.io/kiro-proxy/" />
+  <link rel="canonical" href="https://wnddd839.github.io/kiro.cache/" />
   <link rel="icon" href="./logo.svg" type="image/svg+xml" />
   <style>
     :root {
@@ -562,8 +562,8 @@
   <header class="nav" id="nav">
     <div class="wrap nav-inner">
       <a class="brand" href="./">
-        <img src="./logo.svg" alt="kiro-proxy" width="22" height="22" />
-        <span class="brand-title">kiro-proxy</span>
+        <img src="./logo.svg" alt="kiro.cache" width="22" height="22" />
+        <span class="brand-title">kiro.cache</span>
       </a>
       <nav class="nav-links" aria-label="导航">
         <a class="link-hover" href="#capabilities">能力</a>
@@ -571,24 +571,24 @@
         <a class="link-hover" href="#releases">下载</a>
         <a class="link-hover" href="#started">指南</a>
         <a class="link-hover" href="#compliance">合规</a>
-        <a class="nav-cta" href="https://github.com/wnddd839/kiro-proxy" target="_blank" rel="noopener">GitHub 仓库</a>
+        <a class="nav-cta" href="https://github.com/wnddd839/kiro.cache" target="_blank" rel="noopener">GitHub 仓库</a>
       </nav>
     </div>
   </header>
 
   <main>
     <!-- Hero Section -->
-    <section class="hero" aria-label="kiro-proxy Hero">
+    <section class="hero" aria-label="kiro.cache Hero">
       <div class="wrap">
-        <div class="hero-kicker">Local Kiro Pool Gateway · Issue No. 01</div>
+        <div class="hero-kicker">Sessions · Cache · Usage</div>
         <h1 class="hero-title">
-          把 Kiro 账号池<br />
-          变成 <em>/v1.</em>
+          让每一次使用<br />
+          有迹可循<em>.</em>
         </h1>
         <div class="hero-grid-12">
           <div class="hero-col-lead">
-            对下游说 Anthropic Messages / OpenAI Chat Completions / OpenAI Responses，对上游说 Kiro。
-            会话粘号、稳定 conversationId，把同一段对话认回来，让 Kiro 自己的 prompt cache 打中。
+            会话、缓存、用量与预算，一处查看。
+            把日常使用的细节整理在本机，方便接入熟悉的工具，也方便了解每一次消耗。
           </div>
           <div class="hero-col-actions">
             <div class="hero-btn-row">
@@ -596,7 +596,7 @@
               <a class="btn btn-line" href="http://127.0.0.1:8787/ui" target="_blank">本地管理台</a>
             </div>
             <div style="font-size:12px;color:var(--fg-40);letter-spacing:0.08em;text-transform:uppercase">
-              默认端点 127.0.0.1:8787 · 三种协议 · 号池分发
+              默认端点 127.0.0.1:8787 · 三种协议 · 两本账
             </div>
           </div>
         </div>
@@ -609,16 +609,16 @@
         <div class="col-sidebar">
           <div class="section-num">01 /</div>
           <div class="section-label">Capabilities</div>
-          <h2 class="section-title">只做一件事：<br />把上游 cache 打中.</h2>
+          <h2 class="section-title">使用更连贯，<br />记录更清楚.</h2>
           <p class="section-desc">
-            不是补齐缓存层，也不是账号轮询池。这个项目只做一件事：把多个 Kiro 账号变成合规的下游端点，并让请求前缀字节稳定。
+            从会话连续性到用量记录，把容易忽略的使用细节放在一起。支持个人与小团队在本机管理自己的使用环境。
           </p>
         </div>
 
         <div class="col-content">
           <article class="article-item">
             <div class="article-topline">
-              <h3>三种下游协议</h3>
+              <h3>兼容熟悉的工具</h3>
               <span class="article-index">PROT-01</span>
             </div>
             <p>
@@ -634,13 +634,13 @@
             </div>
             <p>
               会话粘号 + 稳定 <code>conversationId</code> + 前缀修复：剥离 Claude Code 每次都变的 <code>x-anthropic-billing-header</code>、
-              工具声明排序、thinking 预算钉住。同一会话始终回到同一号，只有该号冷却 / 停用 / 满并发才换。
+              工具声明排序，支持的模型使用原生思考参数，预算不再写进文本前缀。同一会话始终回到同一号，只有该号冷却 / 停用 / 满并发才换。
             </p>
           </article>
 
           <article class="article-item">
             <div class="article-topline">
-              <h3>号池与失败自愈</h3>
+              <h3>账号与运行状态</h3>
               <span class="article-index">POOL-03</span>
             </div>
             <p>
@@ -693,7 +693,7 @@
           <div class="section-label">Client Integration</div>
           <h2 class="section-title">换个 Base URL<br />就能接.</h2>
           <p class="section-desc">
-            下游工具链只认 Base URL 与 API Key。网关在本地完成协议翻译，凭证不出本机。
+            通过 Base URL 与 API Key 接入熟悉的工具。账号配置和用量记录集中在本机管理。
           </p>
         </div>
 
@@ -728,7 +728,7 @@
           <div class="section-label">Distribution</div>
           <h2 class="section-title">单文件即用，<br />无需安装.</h2>
           <p class="section-desc">
-            下载对应平台可执行文件，直接运行。没有运行时依赖，账号与账本都落在本机。
+            下载对应平台可执行文件，直接运行。当前发布文件仍沿用 kiro-proxy 名称；账号与账本都落在本机。
           </p>
         </div>
 
@@ -744,27 +744,27 @@
               <tr>
                 <td>Windows 64 位 (x64)</td>
                 <td>
-                  <a href="https://github.com/wnddd839/kiro-proxy/releases/latest/download/kiro-proxy-windows-amd64.exe">kiro-proxy-windows-amd64.exe</a>
+                  <a href="https://github.com/wnddd839/kiro.cache/releases/latest/download/kiro-proxy-windows-amd64.exe">kiro-proxy-windows-amd64.exe</a>
                 </td>
               </tr>
               <tr>
                 <td>Linux 64 位 (amd64)</td>
                 <td>
-                  <a href="https://github.com/wnddd839/kiro-proxy/releases/latest/download/kiro-proxy-linux-amd64">kiro-proxy-linux-amd64</a>
+                  <a href="https://github.com/wnddd839/kiro.cache/releases/latest/download/kiro-proxy-linux-amd64">kiro-proxy-linux-amd64</a>
                 </td>
               </tr>
               <tr>
                 <td>macOS Apple 芯片 (Apple Silicon arm64)</td>
                 <td>
-                  <a href="https://github.com/wnddd839/kiro-proxy/releases/latest/download/kiro-proxy-darwin-arm64">kiro-proxy-darwin-arm64</a>
+                  <a href="https://github.com/wnddd839/kiro.cache/releases/latest/download/kiro-proxy-darwin-arm64">kiro-proxy-darwin-arm64</a>
                 </td>
               </tr>
             </tbody>
           </table>
 
           <div class="dl-meta">
-            完整校验哈希表：<a href="https://github.com/wnddd839/kiro-proxy/releases/latest/download/SHA256SUMS.txt">SHA256SUMS.txt</a>
-            · 也可自行构建：<a href="https://github.com/wnddd839/kiro-proxy#readme">make build</a>
+            完整校验哈希表：<a href="https://github.com/wnddd839/kiro.cache/releases/latest/download/SHA256SUMS.txt">SHA256SUMS.txt</a>
+            · 也可自行构建：<a href="https://github.com/wnddd839/kiro.cache#readme">make build</a>
           </div>
         </div>
       </div>
@@ -811,7 +811,7 @@
         <div class="notice-deck">
           <div class="notice-block">
             <h3>它是什么</h3>
-            <p>一个自行托管、跑在你本机上的反代与号池工具。不提供模型中继，不代管任何账号——<strong>所有流量都从你自己的机器直发 Kiro</strong>，凭证与账本只落本机。</p>
+            <p>一个自行托管的 Kiro 会话与用量工具。<strong>请求由你自己的机器发往 Kiro</strong>，账号配置与账本保存在本机。</p>
           </div>
           <div class="notice-block">
             <h3>你的责任</h3>
@@ -835,8 +835,8 @@
           管理台完成登录，客户端只认 Base URL 和 API Key。纯 Go 单文件，本地运行，零冗余开销。
         </p>
         <div class="hero-btn-row">
-          <a class="btn btn-solid" href="https://github.com/wnddd839/kiro-proxy" target="_blank" rel="noopener">访问 GitHub 仓库</a>
-          <a class="btn btn-line" href="https://github.com/wnddd839/kiro-proxy#readme" target="_blank" rel="noopener">查阅完整 README</a>
+          <a class="btn btn-solid" href="https://github.com/wnddd839/kiro.cache" target="_blank" rel="noopener">访问 GitHub 仓库</a>
+          <a class="btn btn-line" href="https://github.com/wnddd839/kiro.cache#readme" target="_blank" rel="noopener">查阅完整 README</a>
         </div>
       </div>
     </section>
@@ -845,14 +845,14 @@
   <!-- 反相单色页脚 -->
   <footer>
     <div class="wrap footer-flex">
-      <div>kiro-proxy · BSD-3-Clause · 仅限个人授权与合规使用</div>
+      <div>kiro.cache · BSD-3-Clause · 仅限个人授权与合规使用</div>
       <div>与 Kiro、AWS 官方无关联、无隶属、无背书关系</div>
       <div>
-        <a href="https://github.com/wnddd839/kiro-proxy" target="_blank" rel="noopener">Repository</a>
+        <a href="https://github.com/wnddd839/kiro.cache" target="_blank" rel="noopener">Repository</a>
         ·
-        <a href="https://github.com/wnddd839/kiro-proxy#readme" target="_blank" rel="noopener">Documentation</a>
+        <a href="https://github.com/wnddd839/kiro.cache#readme" target="_blank" rel="noopener">Documentation</a>
         ·
-        <a href="https://github.com/wnddd839/kiro-proxy/releases/latest" target="_blank" rel="noopener">Releases</a>
+        <a href="https://github.com/wnddd839/kiro.cache/releases/latest" target="_blank" rel="noopener">Releases</a>
       </div>
     </div>
   </footer>

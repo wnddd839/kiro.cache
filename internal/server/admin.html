@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>kiro-proxy 管理台</title>
+<title>kiro.cache 管理台</title>
 <style>
 :root{
   --bg:#F9F8F6;
@@ -338,7 +338,7 @@ pre{
     <div class="notes">
       <div class="note-item">
         <h3>缓存策略</h3>
-        <p>同一会话粘在同一个号上（session_ttl 内），并为会话生成稳定的 conversationId；请求前缀做修复与规整（sort_tools 排序工具定义、pin_thinking 固定 thinking 配置），保证上游前缀字节一致，以便命中 prompt cache。换号重试会丢失该号上的缓存。</p>
+        <p>同一会话粘在同一个号上（session_ttl 内），并为会话生成稳定的 conversationId；请求前缀做修复与规整（sort_tools 排序工具定义、支持的模型使用原生思考参数，pin_thinking 仅固定旧模型的预算标签），保证上游前缀字节一致，以便命中 prompt cache。换号重试会丢失该号上的缓存。</p>
       </div>
       <div class="note-item">
         <h3>命中率口径</h3>

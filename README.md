@@ -1,18 +1,18 @@
 <p align="center">
-  <img src="docs/logo.svg" width="88" height="88" alt="kiro-proxy" />
+  <img src="docs/logo.svg" width="88" height="88" alt="kiro.cache" />
 </p>
 
-<h1 align="center">kiro-proxy</h1>
+<h1 align="center">kiro.cache</h1>
 
 <p align="center">
-  <strong>把 Kiro 账号池，变成任何 Anthropic / OpenAI 客户端都能直连的本地网关。</strong>
+  <strong>让 Kiro 的日常使用更有条理：会话、缓存、用量与预算，一处查看。</strong>
 </p>
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-BSD--3--Clause-1C1C1C?style=flat-square" alt="License" /></a>
   <a href="https://go.dev/"><img src="https://img.shields.io/badge/Go-%E2%89%A51.26-1C1C1C?style=flat-square&logo=go&logoColor=white" alt="Go" /></a>
-  <img src="https://img.shields.io/badge/Upstream-Kiro%20generateAssistantResponse-1C1C1C?style=flat-square" alt="Kiro" />
-  <img src="https://img.shields.io/badge/Downstream-Anthropic%20%7C%20OpenAI-1C1C1C?style=flat-square" alt="Downstream" />
+  <img src="https://img.shields.io/badge/Kiro-Local%20Tools-1C1C1C?style=flat-square" alt="Kiro" />
+  <img src="https://img.shields.io/badge/Compatible-Anthropic%20%7C%20OpenAI-1C1C1C?style=flat-square" alt="Downstream" />
 </p>
 
 <p align="center">
@@ -25,27 +25,32 @@
 
 ---
 
-> 谁说的「kiro 一积分一刀」，骗我写了这个反代 —— 站出来。
+> 多一点连续性，少一点重复消耗。
 
 ---
 
 ## 一句话
 
-本地反向代理 + 自有 Kiro 号池。**对下游说 Anthropic Messages / OpenAI Chat Completions / OpenAI Responses，对上游说 Kiro `generateAssistantResponse`。**
+一个围绕 Kiro 会话、缓存与用量的本地工具。**把账号管理、客户端接入和预算记录放在一起，方便个人与小团队查看使用情况。**
 
-目标只有一个：**把上游 prompt cache 命中率打上去。**
+关注每次使用的来龙去脉：**缓存如何复用、消耗多少 credits、预算花在哪里。**
 
 **不做本地补全缓存。** 把同一段对话认回来——钉号、钉 `conversationId`、让请求前缀字节稳定，让 Kiro 自己的 cache 打中。详见 [`notes/cache-strategy.md`](notes/cache-strategy.md)。
+
+定位：**个人 / 小团队的 Kiro 预算分摊与用量对账工具**。给下游发带预算的 key，各自看自己的花销。
 
 ## 它做了什么
 
 - **三种下游协议**：Anthropic Messages、OpenAI Chat Completions、OpenAI Responses（含工具调用、reasoning、流式 / 非流式）。
-- **号池**：浏览器 OAuth 登录（Google / GitHub / Builder ID / IAM IdC）、导入 Kiro IDE 凭证、手填 token / API key。单飞 refresh、冷却、额度轮询、全局熔断。
-- **缓存友好分发**：会话粘号 + 稳定 conversationId + 前缀修复（剥离每次都变的 `x-anthropic-billing-header`、工具排序、thinking 钉住）。
-- **计量与账单**：token 估算、本地按 Anthropic 规则模拟 cache read/write、credits 折算、对下游收费与上游成本两本账。
-- **管理台**：号池、用量账单、请求、模型、接入说明，纯静态页 + `/admin/*`。
+- **用量计量**：每次请求拆成 input / cache read / cache write（含 1h）/ output，按 Anthropic 官方规则本地模拟。
+- **两本账**：对下游收费（Claude 官方价）与上游成本（credits 折算）分开记，管理台看毛利与亏损。
+- **缓存命中优化**：会话粘号 + 稳定 conversationId + 前缀修复（剥离每次都变的 `x-anthropic-billing-header`、工具排序、按模型能力使用原生思考参数）。
+- **账号管理**：浏览器 OAuth 登录（Google / GitHub / Builder ID / IAM IdC）、导入 Kiro IDE 凭证、手填 token。单飞 refresh、冷却、额度轮询。
+- **管理台**：概览、账号、用量账单、接入、请求、模型，纯静态页 + `/admin/*`。
 
 ## 快速开始
+
+项目已更名为 `kiro.cache`；当前发布包、启动命令与配置文件仍使用 `kiro-proxy` 名称，下面的命令可直接沿用。
 
 ```sh
 make build                           # 或 go build -o bin/kiro-proxy.exe ./cmd/kiro-proxy
@@ -121,9 +126,9 @@ export OPENAI_BASE_URL=http://127.0.0.1:8787/v1
 | `cache_ttl` | `client` | 客户端声明 `ttl:"1h"` 时：`client` = 按 1h 计；`5m` = 一律按 5m 计 |
 | `cache_points` | 空 | 实验：给 Kiro 发显式 `cachePoint{type:"default"}` 的位置（`first-user` / `assistant` / `tools`）。探测无效果，保持关闭 |
 | `credit_rates` | 内置拟合值 | 按 token 估 credits 的系数，模型前缀 → `{"context","output","read_factor"}`（每百万 token 的 credits），只用于上游没来得及报 credits 的中断请求 |
-| `reported_usage` | `conservative` | 上游若报 tokenUsage 的口径：`conservative` / `raw` / `sum` / `ignore` |
+| `reported_usage` | `conservative` | `conservative` / `raw` 按字段保留最后上报值，缺失不覆盖、显式 0 覆盖；`sum` 累加，`ignore` 用本地计量 |
 | `openai_hosted_tools` | `drop` | OpenAI 内置工具（web_search 等）：`drop` 跳过并打 debug 日志；`reject` 返回 400 |
-| `identity` | kiro-cli 2.28.0 | 对上游的客户端身份（CLI 版本 / api_version / desktop UA） |
+| `identity` | kiro-cli 2.28.0 | 对上游声明的客户端身份（CLI 版本 / api_version / desktop UA），对齐 kiro-cli 以获得稳定兼容性 |
 | `cost_basis` | `api` | 对下游收费口径：`api` = Claude API 官方价；`credits` = credits × `credit_usd` |
 | `credit_usd` | `0.02` | 一个 Kiro credit 的美元价，用于算上游成本与毛利 |
 | `prices` | 内置 | 覆盖价格表：模型 id 前缀 → `{"input","output","cache_write","cache_write_1h","cache_read"}`（USD/百万 token） |
@@ -133,7 +138,7 @@ export OPENAI_BASE_URL=http://127.0.0.1:8787/v1
 | `session_ttl` | `45m` | 会话 → 号、→ conversationId 的空闲过期 |
 | `conversation_mode` | `session` | `random` = 每次随机，用于 A/B 对照命中率 |
 | `sort_tools` | `true` | 工具声明按名排序（MCP 加载顺序不定） |
-| `pin_thinking` | `true` | 会话内 thinking 预算以首次为准 |
+| `pin_thinking` | `true` | 仅对没有原生参数 schema 的旧模型固定首次 thinking 预算；原生 effort 按每次请求生效 |
 | `system_strip` | 空 | 从 system 删掉的正则；确认打破 cache 再加 |
 | `model_aliases` | 空 | 下游模型名 → Kiro 模型 id |
 | `max_attempts` | `3` | 一次请求最多试几个号 |
@@ -147,8 +152,16 @@ export OPENAI_BASE_URL=http://127.0.0.1:8787/v1
 1. **会话键**：header（`X-Session-Id` 等）→ `metadata.user_id` 里的 session → system + 首条 user 指纹。
 2. **粘号**：同一会话始终回到同一号；只有该号冷却 / 停用 / 满并发才换。新会话挑并发最少、剩余额度最多、最久没用的号。
 3. **稳定 conversationId**：按 会话 → 号 → conversationId 钉住；历史被回退 / 编辑 / 压缩时只轮换该号的。
-4. **前缀修复**：剥离 Claude Code 的 `x-anthropic-billing-header`（`cch` 每次变）、工具排序、thinking 钉住、可选 system 正则。
+4. **前缀修复**：剥离 Claude Code 的 `x-anthropic-billing-header`（`cch` 每次变）、工具排序、可选 system 正则。支持原生思考参数的模型不再向 prompt 注入预算标签；旧模型保留标签与预算钉住。
 5. **分号统计**：`/admin/stats` 与 `/admin/accounts` 给出 `cache_read / cache_write / input`，切 `conversation_mode` 做 A/B。
+
+## 思考参数与工具描述
+
+首次生成请求先读取模型目录的 `additionalModelRequestFieldsSchema`，后续按目录缓存刷新。Claude 类模型声明了 `output_config.effort` 时使用原生强度与 schema 允许的 `thinking` 配置；声明 `reasoning.effort` 的模型使用该字段。客户端的 `budget_tokens` 会映射为模型接受的强度，未指定预算时采用 schema 默认值。没有 schema 的旧模型保留原有 thinking 标签路径。
+
+原生参数放在请求根部的 `additionalModelRequestFields`，改变强度不会改写 system / history。不过 Sonnet 4.6 的实测中，首次切换 effort 后 credits 仍回到冷请求水平；本地缓存按生效参数隔离，不假定不同强度可以共用上游缓存。见 [实测记录](notes/native-thinking.md)。
+
+工具描述限制为 **10240 UTF-8 字节**，截断保留完整字符；本地计量与上游请求共用截断后的描述。
 
 ## 用量与计费口径
 
@@ -186,11 +199,13 @@ Kiro 的流里一般**不报 token**，只报上下文占用百分比和 credits
 kiro-proxy -config kiro-proxy.json probe usage        # 上游报不报 tokenUsage、报几次、是否累计
 kiro-proxy -config kiro-proxy.json probe cachepoint   # 显式 cachePoint 开 / 不开
 kiro-proxy -config kiro-proxy.json probe credits      # 前缀冷热 + 长输出，拟合 credits 折算
-kiro-proxy -config kiro-proxy.json probe ttl          # 缓存存活时间（约 70 分钟）
+kiro-proxy -config kiro-proxy.json probe ttl          # 缓存存活时间（实测约 5 分钟）
 kiro-proxy -config kiro-proxy.json probe analyze -out probe.jsonl
 ```
 
 用一个号直打上游（会花 credits），每次调用一行 JSONL，实验前后各拉一次额度核对。`analyze` 给出 TTL 命中表、cachePoint 对比、可直接贴进配置的 `credit_rates`。
+
+实测结论（2026-10，claude-sonnet-4.5）：缓存存活约 **5 分钟**（间隔 0 / 4min 命中，6min 起不命中），与 Anthropic 默认 5m TTL 一致；请求声明 `ttl: "1h"` 且配置 `cache_ttl: "client"` 时，只在本地按客户端声明计费，**上游不分 TTL**。
 
 ## 开发
 
@@ -224,7 +239,14 @@ CI 见 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)。
 
 ## 免责声明
 
-本项目仅用于**个人学习与自用**。使用前请确认你的行为符合 Kiro / AWS 的服务条款；由此产生的一切后果由使用者自行承担。
+本项目仅用于**个人学习、研究与自用**。使用前请阅读以下各条：
+
+- **条款风险**：Kiro / AWS 的服务条款**不允许在官方客户端之外使用其订阅**。是否允许此类调用由你与 Kiro / AWS 的协议决定。使用本项目**可能导致账号受到限制或暂停**，用户自担全部风险。
+- **不提供规避手段**：本项目不提供任何规避平台风控、检测或限流的功能（无逐账号代理、无出口 IP 管理、无请求特征伪装）。不要把它当“防封”工具。
+- **不得转售**：不得将本项目用于代充、售卖额度、倒卖账号或任何商业转售场景。
+- **按原样提供**：软件按开源「原样」免费提供，不对上游协议持续兼容作任何保证；不提供账号，不代管凭据。
+
+本项目与 Kiro、AWS 官方**无关联、无隶属、无背书关系**。
 
 ## License
 
