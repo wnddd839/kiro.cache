@@ -217,7 +217,8 @@ td.bad{font-weight:600;text-decoration:underline;text-decoration-thickness:1px;t
 .secret{font-family:var(--mono);font-size:11.5px;cursor:pointer}
 
 /* 接入 */
-.copyline{display:grid;grid-template-columns:1fr auto;gap:12px;align-items:end;margin-bottom:16px}
+.copyline{display:grid;grid-template-columns:1fr auto;gap:12px;align-items:center}
+.copyline input{font-family:var(--mono);font-size:12.5px}
 pre{
   margin:0;padding:14px;border:1px solid var(--fg-10);white-space:pre-wrap;word-break:break-all;
   font-family:var(--mono);font-size:12px;line-height:1.6;color:var(--fg-80);
@@ -225,6 +226,17 @@ pre{
 .code-block{margin-bottom:20px}
 .code-block .actions{justify-content:space-between;margin-bottom:8px}
 .code-block h3{margin:0;font-family:var(--display);font-size:16px;font-weight:400}
+
+/* 客户端接入（对齐 codebuddy console） */
+.field-grid{display:grid;grid-template-columns:1fr 1.4fr;gap:16px;margin:8px 0 16px}
+.bound-keys{margin-top:18px;display:flex;flex-direction:column;gap:0}
+.bound-key{
+  display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;
+  padding:12px 0;border-top:1px solid var(--fg-10);
+}
+.bound-key .meta{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.secret-hint{margin-top:12px;font-size:12px;color:var(--fg-40);line-height:1.5}
+@media (max-width:640px){.field-grid{grid-template-columns:1fr}}
 
 /* token 面板与 toast */
 .token-gate{border:1px solid var(--fg);padding:24px;margin-bottom:24px}
@@ -267,10 +279,9 @@ pre{
     <button type="button" class="tab-link active" data-tab="overview"><span class="tab-idx">01 /</span> 概览</button>
     <button type="button" class="tab-link" data-tab="pool"><span class="tab-idx">02 /</span> 号池</button>
     <button type="button" class="tab-link" data-tab="billing"><span class="tab-idx">03 /</span> 用量账单</button>
-    <button type="button" class="tab-link" data-tab="keys"><span class="tab-idx">04 /</span> Key</button>
+    <button type="button" class="tab-link" data-tab="connect"><span class="tab-idx">04 /</span> 接入</button>
     <button type="button" class="tab-link" data-tab="requests"><span class="tab-idx">05 /</span> 请求</button>
     <button type="button" class="tab-link" data-tab="models"><span class="tab-idx">06 /</span> 模型</button>
-    <button type="button" class="tab-link" data-tab="connect"><span class="tab-idx">07 /</span> 接入</button>
   </nav>
 
   <!-- 01 概览 -->
@@ -459,37 +470,6 @@ pre{
 	    </section>
 	  </div>
 
-  <!-- 04 Key -->
-  <div class="tab-panel" id="tab-keys">
-    <section class="panel">
-      <div class="section-head"><div><h2>新建下游 key</h2><p id="keysOpen">给不同客户端 / 项目分发的 key，各自预算与限速。</p></div></div>
-      <div class="form-grid">
-        <div><label for="kName">名称</label><input type="text" id="kName" placeholder="如 claude-code / cursor"></div>
-        <div><label for="kPeriod">预算周期</label><select id="kPeriod"><option value="month">每月</option><option value="week">每周</option><option value="day">每日</option><option value="total">总计</option></select></div>
-        <div><label for="kUSD">预算 USD</label><input type="number" class="mono" id="kUSD" min="0" step="0.01" placeholder="0 = 不限"></div>
-        <div><label for="kCredits">预算 credits</label><input type="number" class="mono" id="kCredits" min="0" step="0.1" placeholder="0 = 不限"></div>
-        <div><label for="kReq">请求数上限</label><input type="number" class="mono" id="kReq" min="0" placeholder="0 = 不限"></div>
-        <div><label for="kRPM">RPM</label><input type="number" class="mono" id="kRPM" min="0" placeholder="0 = 不限"></div>
-        <div class="wide"><label for="kModels">模型白名单</label><input type="text" class="mono" id="kModels" placeholder="逗号分隔，支持 * 通配；留空 = 全部"></div>
-        <div><label for="kExpires">过期</label><input type="date" class="mono" id="kExpires"></div>
-        <div class="wide"><label for="kNote">备注</label><input type="text" id="kNote"></div>
-      </div>
-      <div class="actions"><button class="primary" type="button" id="btnKeyCreate">创建</button><span class="hint" style="margin:0">secret 只在创建 / 换 secret 时显示一次，服务端只存哈希。</span></div>
-      <div class="copyline" id="newSecretBox" hidden style="margin-top:16px">
-        <div><label for="newSecret" id="newSecretLabel">新 secret</label><input type="text" class="mono" id="newSecret" readonly></div>
-        <div class="actions"><button type="button" data-copy="newSecret">复制</button><button type="button" id="btnNewSecretDone">已保存，关闭</button></div>
-        <p class="hint" style="grid-column:1/-1;margin:0">关闭或刷新页面后无法再查看；丢了只能换一个。</p>
-      </div>
-    </section>
-    <section class="panel">
-      <div class="section-head">
-        <div><h2>key 列表</h2><p id="keysMeta">—</p></div>
-        <div class="actions"><button type="button" id="btnKeysRefresh">刷新</button></div>
-      </div>
-      <div class="table-wrap" id="keysTable"><div class="empty">加载中</div></div>
-    </section>
-  </div>
-
   <!-- 05 请求 -->
   <div class="tab-panel" id="tab-requests">
     <section class="panel">
@@ -516,15 +496,51 @@ pre{
     </section>
   </div>
 
-  <!-- 07 接入 -->
+  <!-- 04 接入 -->
   <div class="tab-panel" id="tab-connect">
-    <section class="panel">
-      <div class="section-head"><div><h2>客户端接入</h2><p>Anthropic Messages、OpenAI Chat Completions、OpenAI Responses 三种协议。</p></div></div>
-      <div class="copyline">
-        <div><label for="baseUrl">Base URL</label><input type="text" class="mono" id="baseUrl" readonly></div>
-        <button type="button" data-copy="baseUrl">复制</button>
+    <section class="panel" id="client-config">
+      <div class="section-head">
+        <div><h2>客户端接入</h2><p>下游填 Base URL + API Key；不会暴露 Kiro 凭证。</p></div>
+        <div class="actions">
+          <button class="ghost" type="button" id="btnConnectRefresh">刷新接入信息</button>
+          <button class="primary" type="button" id="btnGenerateKey">生成 API Key</button>
+        </div>
       </div>
-      <div class="box" id="authHint" style="margin:0 0 20px"><div class="title">鉴权</div><div class="msg" id="authHintMsg">—</div></div>
+      <div class="field-grid" style="grid-template-columns:1fr 1fr">
+        <div>
+          <label for="baseUrl">Base URL（Anthropic）</label>
+          <div class="copyline">
+            <input id="baseUrl" class="mono" readonly placeholder="加载中…">
+            <button type="button" data-copy="baseUrl">复制</button>
+          </div>
+        </div>
+        <div>
+          <label for="openAiBase">Base URL（OpenAI）</label>
+          <div class="copyline">
+            <input id="openAiBase" class="mono" readonly placeholder="加载中…">
+            <button type="button" data-copy="openAiBase">复制</button>
+          </div>
+        </div>
+        <div>
+          <label for="apiKey">API Key</label>
+          <div class="copyline">
+            <input id="apiKey" class="mono" type="password" readonly placeholder="未配置">
+            <button type="button" id="copyApiKey">复制</button>
+          </div>
+          <div class="secret-hint" id="apiKeyHint">服务端只存哈希，明文仅在生成 / 换 secret 时显示一次。</div>
+        </div>
+        <div>
+          <label for="recModel">推荐模型</label>
+          <div class="copyline">
+            <input id="recModel" class="mono" readonly value="claude-sonnet-4.5">
+            <button type="button" data-copy="recModel">复制</button>
+          </div>
+        </div>
+      </div>
+      <div class="bound-keys" id="apiKeys"></div>
+    </section>
+
+    <section class="panel">
       <div class="code-block">
         <div class="actions"><h3>Claude Code 环境变量</h3><button type="button" data-copy="envCode">复制</button></div>
         <pre id="envCode"></pre>
@@ -553,8 +569,8 @@ pre{
 'use strict';
 
 var TOKEN_KEY = 'kiro-proxy.admin-token';
-var TABS = ['overview', 'pool', 'billing', 'keys', 'requests', 'models', 'connect'];
-var state = { tab: 'overview', overview: null, accounts: [], models: [], keys: [], picked: {}, bill: null, billPage: 1, loginTimer: null, tokenWaiters: [] };
+var TABS = ['overview', 'pool', 'billing', 'connect', 'requests', 'models'];
+var state = { tab: 'overview', overview: null, accounts: [], models: [], keys: [], keySecrets: {}, picked: {}, bill: null, billPage: 1, loginTimer: null, tokenWaiters: [] };
 
 function $(id){ return document.getElementById(id); }
 
@@ -736,10 +752,9 @@ function loadTab(name){
   if (name === 'overview') loadOverview().catch(ignore);
   else if (name === 'pool') { loadAccounts().catch(ignore); loadLogin(true); }
 	  else if (name === 'billing') { if (!$('bFrom').value) setRange('month'); loadBilling().catch(ignore); }
-  else if (name === 'keys') loadKeys().catch(ignore);
   else if (name === 'requests') loadRequests().catch(ignore);
   else if (name === 'models') loadModels().catch(ignore);
-  else if (name === 'connect') { if (!state.overview) loadOverview().catch(ignore); renderConnect(); }
+  else if (name === 'connect') { if (!state.overview) loadOverview().catch(ignore); loadKeys().catch(ignore); renderConnect(); }
 }
 
 /* ---------- 健康 / 顶栏 ---------- */
@@ -1417,104 +1432,85 @@ function loadAccountsQuiet(){
 	  return String(v);
 	}
 
-/* ---------- 04 Key ---------- */
+/* ---------- 04 接入 / API Key ---------- */
 function loadKeys(){
   return api('GET', '/admin/keys').then(function(d){
     state.keys = (d && d.keys) || [];
-    $('keysOpen').textContent = d.open
-      ? '当前没有任何 key，/v1/* 对本机开放。创建第一把 key 后即要求鉴权。'
-      : '给不同客户端 / 项目分发的 key，各自预算与限速。配置文件 api_keys 中的 key 不受预算约束。';
-    renderKeys();
+    renderApiKeys();
+    renderConnect();
     return d;
   });
 }
-function budgetCell(k){
-  var parts = [];
-  var sp = k.spent || {};
-  function bar(used, limit, fmt){
-    var pct = limit > 0 ? Math.min(100, used / limit * 100) : 0;
-    return '<div class="quota"><div class="quota-head"><span class="mono">' + escapeHtml(fmt(used)) + ' / ' + escapeHtml(fmt(limit)) + '</span><span class="mono">' + pct.toFixed(0) + '%</span></div><div class="bar"><i style="width:' + pct.toFixed(1) + '%"></i></div></div>';
-  }
-	  if (k.limit_usd) parts.push(bar(Number(sp.cost_usd || 0), k.limit_usd, fmtUSD));
-	  if (k.limit_credits) parts.push(bar(Number(sp.credits || 0), k.limit_credits, function(x){ return fmtNum(x, 2) + ' cr'; }));
-	  if (k.limit_requests) parts.push(bar(Number(sp.requests || 0), k.limit_requests, function(x){ return fmtN(x) + ' 次'; }));
-	  if (!parts.length) parts.push('<span class="meta">不限 · 已用 ' + escapeHtml(fmtNum(sp.credits, 2)) + ' cr</span>');
-  return parts.join('');
+function keyPreview(k){ return (k && (k.hint || k.name)) || '—'; }
+function hasKey(){
+  return (state.keys || []).length > 0 || !!((state.overview && state.overview.auth) || {}).api_keys;
 }
-function renderKeys(){
-  var list = state.keys;
-  $('keysMeta').textContent = '共 ' + list.length + ' 把。已用按各自周期统计。';
-  if (!list.length) { $('keysTable').innerHTML = '<div class="empty">暂无 key</div>'; return; }
-  var periods = { day: '每日', week: '每周', month: '每月', total: '总计' };
-  var h = '<table><thead><tr><th>名称</th><th>secret</th><th>状态</th><th>周期</th><th style="min-width:180px">预算</th><th class="num">RPM</th><th>模型</th><th>过期</th><th>最近使用</th><th class="num">本期请求</th><th>操作</th></tr></thead><tbody>';
-  list.forEach(function(k){
+function renderApiKeys(){
+  var box = $('apiKeys');
+  if (!box) return;
+  var list = state.keys || [];
+  var configured = !!((state.overview && state.overview.auth) || {}).api_keys;
+  if (!list.length) {
+    box.innerHTML = '<div class="empty">' + (configured
+      ? '配置文件 api_keys 里已有全权 key（不受任何限额，页面不显示明文）。生成的 key 会列在这里。'
+      : '还没有 key，/v1/* 对本机开放。点「生成 API Key」创建一把。') + '</div>';
+    return;
+  }
+  box.innerHTML = list.map(function(k){
     var id = escapeHtml(k.id);
-    var expired = k.expires_at && parseTime(k.expires_at) < Date.now();
-    var st = k.disabled ? '<span class="badge off">停用</span>' : expired ? '<span class="badge dash">已过期</span>' : '<span class="badge solid">可用</span>';
-    h += '<tr><td><strong>' + escapeHtml(k.name) + '</strong>' + (k.note ? '<div class="meta">' + escapeHtml(k.note) + '</div>' : '') + '</td>' +
-      '<td><span class="mono" title="只存哈希，无法再查看完整 secret">' + escapeHtml(k.hint || '—') + '</span></td>' +
-      '<td>' + st + '</td>' +
-      '<td>' + escapeHtml(periods[k.period || 'month'] || k.period) + '<div class="meta">自 ' + escapeHtml(fmtTime(k.period_start).slice(0, 10)) + '</div></td>' +
-      '<td>' + budgetCell(k) + '</td>' +
-      '<td class="num">' + (k.rpm ? escapeHtml(fmtN(k.rpm)) : '<span class="meta">—</span>') + '</td>' +
-      '<td class="mono trunc">' + escapeHtml((k.models || []).join(', ') || '全部') + '</td>' +
-      '<td class="mono">' + (k.expires_at ? escapeHtml(fmtTime(k.expires_at).slice(0, 10)) : '—') + '</td>' +
-      '<td class="mono">' + (k.last_used ? escapeHtml(relTime(k.last_used)) : '—') + '</td>' +
-      '<td class="num">' + escapeHtml(fmtN((k.spent || {}).requests)) + '</td>' +
-      '<td><div class="actions">' +
-        '<button type="button" data-key-act="edit" data-id="' + id + '">改预算</button>' +
-        '<button type="button" data-key-act="' + (k.disabled ? 'enable' : 'disable') + '" data-id="' + id + '">' + (k.disabled ? '启用' : '停用') + '</button>' +
-        '<button type="button" data-key-act="rotate" data-id="' + id + '">换 secret</button>' +
-        '<button type="button" class="danger" data-key-act="delete" data-id="' + id + '">删除</button>' +
-      '</div></td></tr>';
-  });
-  $('keysTable').innerHTML = h + '</tbody></table>';
+    var secret = state.keySecrets[k.id] || '';
+    return '<div class="bound-key">' +
+      '<div class="meta"><span class="mono">' + escapeHtml(keyPreview(k)) + '</span>' +
+      '<span class="badge">' + escapeHtml(k.name || 'key') + '</span>' +
+      (k.disabled ? '<span class="badge off">停用</span>' : '') +
+      (k.created_at ? '<span class="meta">' + escapeHtml(fmtTime(k.created_at)) + '</span>' : '') + '</div>' +
+      '<div class="actions">' +
+      (secret ? '<button type="button" data-key-act="copy" data-id="' + id + '">复制</button>' : '') +
+      '<button type="button" data-key-act="rotate" data-id="' + id + '">换 secret</button>' +
+      '<button type="button" class="danger" data-key-act="delete" data-id="' + id + '">删除</button>' +
+      '</div></div>';
+  }).join('');
 }
-// showNewSecret 把只显示一次的明文 secret 放进一次性面板并复制。
-function showNewSecret(k, verb){
-  $('newSecretLabel').textContent = verb + ' ' + k.name + ' 的 secret';
-  $('newSecret').value = k.secret || '';
-  $('newSecretBox').hidden = !k.secret;
-  if (k.secret) { copyText(k.secret); $('newSecret').select(); }
-  toast(verb + ' ' + k.name + '，secret 只显示这一次');
+function showApiKey(params, verb){
+  var k = (params && params.key) || (params && params.keys && params.keys[params.keys.length - 1]) || {};
+  var secret = (params && params.secret) || k.secret || '';
+  if (k.id && secret) state.keySecrets[k.id] = secret;
+  $('apiKey').value = secret || (k.hint || '');
+  $('copyApiKey').disabled = !secret;
+  if (secret) copyText(secret);
+  toast(verb + (verb ? '，' : '') + 'secret 只在本次显示，关闭页面后只看得到遮掩值');
 }
-function numOr0(id){ var v = Number($(id).value); return isFinite(v) && v > 0 ? v : 0; }
-function createKey(){
-  var name = $('kName').value.trim();
-  if (!name) { toast('名称必填', true); return; }
-  var body = {
-    name: name, period: $('kPeriod').value,
-    limit_usd: numOr0('kUSD'), limit_credits: numOr0('kCredits'), limit_requests: Math.floor(numOr0('kReq')), rpm: Math.floor(numOr0('kRPM')),
-    models: $('kModels').value.split(',').map(function(x){ return x.trim(); }).filter(Boolean),
-    note: $('kNote').value.trim()
-  };
-  if ($('kExpires').value) body.expires_at = new Date($('kExpires').value + 'T23:59:59').toISOString();
-  api('POST', '/admin/keys', body).then(function(k){
-    showNewSecret(k, '已创建');
-    ['kName', 'kUSD', 'kCredits', 'kReq', 'kRPM', 'kModels', 'kExpires', 'kNote'].forEach(function(f){ $(f).value = ''; });
+function generateApiKey(){
+  var name = prompt('这把 API Key 的名称', 'gateway');
+  if (name === null) return;
+  name = String(name).trim() || 'gateway';
+  var btn = $('btnGenerateKey');
+  btn.disabled = true;
+  api('POST', '/admin/keys', { name: name }).then(function(k){
+    if (k && k.secret) { state.keySecrets[k.id] = k.secret; $('apiKey').value = k.secret; $('copyApiKey').disabled = false; copyText(k.secret); }
+    toast('已生成 API Key：' + name);
     return loadKeys();
-  }).catch(ignore);
+  }).catch(ignore).then(function(){ btn.disabled = false; });
 }
-function onKeyAction(btn){
+function onApiKeyAction(btn){
   var act = btn.getAttribute('data-key-act'), id = btn.getAttribute('data-id');
-  var k = state.keys.filter(function(x){ return x.id === id; })[0];
-  if (!k) return;
+  if (act === 'copy') { copyText(state.keySecrets[id] || ''); return; }
   var req;
-  if (act === 'enable' || act === 'disable') req = api('PATCH', '/admin/keys/' + encodeURIComponent(id), { disabled: act === 'disable' });
-  else if (act === 'rotate') {
-    if (!confirm('换掉 ' + k.name + ' 的 secret？旧 secret 立即失效。')) return;
-    req = api('POST', '/admin/keys/' + encodeURIComponent(id) + '/rotate').then(function(n){ showNewSecret(n, '已更换'); return n; });
+  if (act === 'rotate') {
+    if (!confirm('换掉这把 key 的 secret？旧 secret 立即失效。')) return;
+    req = api('POST', '/admin/keys/' + encodeURIComponent(id) + '/rotate').then(function(k){
+      state.keySecrets[id] = (k && k.secret) || '';
+      $('apiKey').value = state.keySecrets[id] || '';
+      $('copyApiKey').disabled = !state.keySecrets[id];
+      if (state.keySecrets[id]) copyText(state.keySecrets[id]);
+      toast('已换 secret，旧 secret 立即失效');
+      return loadKeys();
+    });
   } else if (act === 'delete') {
-    if (!confirm('删除 key ' + k.name + '？历史用量保留。')) return;
-    req = api('DELETE', '/admin/keys/' + encodeURIComponent(id));
-  } else if (act === 'edit') {
-    var usd = prompt('预算 USD（0 = 不限）', String(k.limit_usd || 0));
-    if (usd === null) return;
-    var rpm = prompt('RPM（0 = 不限）', String(k.rpm || 0));
-    if (rpm === null) return;
-    req = api('PATCH', '/admin/keys/' + encodeURIComponent(id), { limit_usd: Math.max(0, Number(usd) || 0), rpm: Math.max(0, Math.floor(Number(rpm) || 0)) });
+    if (!confirm('删除这把 key？历史用量保留。')) return;
+    req = api('DELETE', '/admin/keys/' + encodeURIComponent(id)).then(function(){ delete state.keySecrets[id]; return loadKeys(); });
   }
-  if (req) req.then(function(){ return loadKeys(); }).catch(ignore);
+  if (req) req.catch(ignore);
 }
 
 /* ---------- 05 请求 ---------- */
@@ -1634,6 +1630,13 @@ function renderConnect(){
     }
   }
   $('baseUrl').value = origin;
+  $('openAiBase').value = origin + '/v1';
+  $('recModel').value = model;
+  // 已生成的明文只在本次页面停留：否则只显示遮掩提示
+  if (!$('apiKey').value) {
+    $('apiKey').placeholder = hasKey() ? '已配置 · 生成时显示明文' : '未配置';
+    $('copyApiKey').disabled = true;
+  }
   var env = 'export ANTHROPIC_BASE_URL=' + origin + '\n';
   if (auth.api_keys) env += 'export ANTHROPIC_AUTH_TOKEN=<你的 api key>\n';
   env += '\n# Windows PowerShell\n$env:ANTHROPIC_BASE_URL = "' + origin + '"\n';
@@ -1646,11 +1649,10 @@ function renderConnect(){
   if (auth.api_keys) curl += '  -H "x-api-key: <你的 api key>" \\\n';
   curl += '  -d \'{"model":"' + model + '","max_tokens":256,"messages":[{"role":"user","content":"ping"}]}\'';
   $('curlCode').textContent = curl;
-  var hint;
-  if (!state.overview) hint = '未取得服务端鉴权配置。';
-  else if (auth.api_keys) hint = '服务端启用了 api_keys：客户端需携带 key（ANTHROPIC_AUTH_TOKEN，即 Authorization: Bearer，或 x-api-key 头）。页面不显示 key 值，请从配置文件获取。';
-  else hint = '服务端未启用 api_keys：无需携带 key，任意或空的 ANTHROPIC_AUTH_TOKEN 均可。仅建议在本机监听时使用。';
-  $('authHintMsg').textContent = hint;
+  $('apiKeyHint').textContent = hasKey()
+    ? '客户端带 ANTHROPIC_AUTH_TOKEN（即 Authorization: Bearer）或 x-api-key 头。服务端只存哈希，明文仅在生成 / 换 secret 时显示一次。'
+    : '还没配 key：/v1/* 对本机开放。点右上角「生成 API Key」创建第一把。';
+  renderApiKeys();
 }
 function copyText(text){
   function fallback(){
@@ -1716,14 +1718,12 @@ $('btnBill').addEventListener('click', function(){ state.billPage = 1; loadBilli
 $('btnBillCsv').addEventListener('click', exportCSV);
 $('bPrev').addEventListener('click', function(){ if (state.billPage > 1) { state.billPage--; loadBilling().catch(ignore); } });
 $('bNext').addEventListener('click', function(){ state.billPage++; loadBilling().catch(ignore); });
-$('btnKeyCreate').addEventListener('click', createKey);
-$('btnNewSecretDone').addEventListener('click', function(){ $('newSecret').value = ''; $('newSecretBox').hidden = true; });
-$('btnKeysRefresh').addEventListener('click', function(){ loadKeys().then(function(){ toast('已刷新'); }).catch(ignore); });
-$('keysTable').addEventListener('click', function(e){
-  var sec = e.target.closest('[data-secret]');
-  if (sec) { copyText(sec.getAttribute('data-secret')); return; }
+$('btnGenerateKey').addEventListener('click', generateApiKey);
+$('btnConnectRefresh').addEventListener('click', function(){ loadKeys().then(function(){ renderConnect(); toast('已刷新接入信息'); }).catch(ignore); });
+$('copyApiKey').addEventListener('click', function(){ copyText($('apiKey').value); });
+$('apiKeys').addEventListener('click', function(e){
   var btn = e.target.closest('button[data-key-act]');
-  if (btn) onKeyAction(btn);
+  if (btn && !btn.disabled) onApiKeyAction(btn);
 });
 $('btnReqRefresh').addEventListener('click', function(){ loadRequests().catch(ignore); });
 	$('btnModelsRefresh').addEventListener('click', refreshModels);
