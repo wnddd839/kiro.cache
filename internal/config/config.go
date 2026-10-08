@@ -135,7 +135,7 @@ func Default() Config {
 		PinThinking:       true,
 		MaxAttempts:       3,
 		MaxConcurrent:     3,
-		LimitsInterval:    Duration(10 * time.Minute),
+		LimitsInterval:    0, // 不定时轮询：只在号报额度用尽时查它一个
 		BreakerWindow:     Duration(2 * time.Minute),
 		LogLevel:          "info",
 	}

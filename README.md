@@ -67,7 +67,7 @@ bin/kiro-proxy.exe -version
 | `credit_rates` | 探测拟合值 | 按 token 估 credits 的系数（模型前缀 → `{"context","output","read_factor"}`，每百万 token 的 credits），只用于上游来不及报 credits 的中断请求。内置 claude：4.108 / 109 / 0.53（sonnet-4.5 实测） |
 | `reported_usage` | `conservative` | 上游若报 tokenUsage 的口径：`conservative`（多条取最后一条、输入扣 Kiro 隐藏 token）/ `raw` / `sum` / `ignore`。上游目前不报 |
 | `openai_hosted_tools` | `drop` | OpenAI 内置工具（web_search 等，Codex 默认带）：`drop` 跳过这些工具与它们的历史调用并打 debug 日志；`reject` 返回 400 说明原因 |
-| `identity` | CLI 1.28.3 | 对上游的客户端身份：`{"cli_version":"1.28.3","desktop_ua":"Kiro-Desktop/0.2.13 (darwin; arm64)"}`。对话 / OIDC 刷新 / management 都用 CLI 身份，每个号一个固定机器码 |
+| `identity` | kiro-cli 2.28.0 | 对上游的客户端身份：`{"cli_version":"2.28.0","api_version":"0.1.17975","desktop_ua":"Kiro-Desktop/0.2.13 (darwin; arm64)"}`。对话 / OIDC 刷新 / management 都用 kiro-cli 2.x 的 UA（`aws-sdk-rust/1.3.15 … md/appVersion-<cli_version> app/AmazonQ-For-CLI`，x-amz-user-agent 是不带 appVersion 的 `m/F` 版）。`api_version` 取自公开抓包（2.14.2），2.28.0 的实际值未抓到 |
 | `cost_basis` | `api` | 对下游收费口径（key 的 `limit_usd`）：`api` = Claude API 官方价（默认，下游可逐项复核）；`credits` = credits × `credit_usd`。下游 usage 不报美元 |
 | `credit_usd` | `0.02` | 一个 Kiro credit 的美元价：账本里的「上游成本」= credits × 它，毛利 / 亏损按它算 |
 | `prices` | 内置 | 覆盖价格表：模型 id 前缀 → `{"input","output","cache_write","cache_write_1h","cache_read"}`（USD/百万 token），优先级最高 |
@@ -82,7 +82,7 @@ bin/kiro-proxy.exe -version
 | `model_aliases` | 空 | 下游模型名 → Kiro 模型 id |
 | `max_attempts` | `3` | 一次请求最多试几个号 |
 | `max_concurrent` | `3` | 每个号同时进行的请求数默认上限；号上单独设了 `max_concurrent`（加号时 / 号池文件）就以号上的为准。`0` = 不限 |
-| `limits_interval` | `10m` | 额度轮询间隔，`0s` 关闭 |
+| `limits_interval` | `0s` | 额度定时轮询间隔，默认关闭：只在某个号请求报额度用尽时查它一个（拿重置时间）。设成正值会恢复按间隔遍历所有号 |
 | `breaker_window` | `2m` | 全局熔断窗口：窗口内超过一半的启用号（且至少 2 个）出现同一类失败（刷新失败 / 403 / 网络错误），判定为全局故障：只冷却、不停号、不累计停号次数，打告警并在管理台显示；任一请求成功即解除。`invalid_grant` 与封号文字不受影响，照样立即停号 |
 | `log_level` | `info` | |
 

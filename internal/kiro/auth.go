@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptrace"
 	"net/url"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -35,19 +36,24 @@ const BuilderIDProfile = "arn:aws:codewhisperer:us-east-1:638616132270:profile/A
 // Identity 是对上游报的客户端身份。对话、OIDC 刷新、management 调用都用同一套 CLI 身份（Amazon Q CLI，
 // 与 origin=KIRO_CLI 一致）；social 的 refresh 走 Kiro auth service，那里只认 Kiro-Desktop。不混用 IDE 的 UA。
 type Identity struct {
-	// CLIVersion 是 Amazon Q CLI 的版本（api/codewhispererstreaming#… 与 md/appVersion-…）。
+	// CLIVersion 是 kiro-cli 的版本（md/appVersion-…）。
 	CLIVersion string `json:"cli_version,omitzero"`
+	// APIVersion 是 UA 里 api/codewhispererstreaming/… 的 SDK 版本，随 CLI 版本走。
+	APIVersion string `json:"api_version,omitzero"`
 	// DesktopUA 是 social refresh 用的 User-Agent。
 	DesktopUA string `json:"desktop_ua,omitzero"`
 }
 
-// DefaultIdentity 是现在的默认身份（与之前写死的值一致）。
-var DefaultIdentity = Identity{CLIVersion: "1.28.3", DesktopUA: "Kiro-Desktop/0.2.13 (darwin; arm64)"}
+// DefaultIdentity 是现在的默认身份。APIVersion 取公开抓包里最新的值（kiro-cli 2.14.2），2.28.0 的实际值未知。
+var DefaultIdentity = Identity{CLIVersion: "2.28.0", APIVersion: "0.1.17975", DesktopUA: "Kiro-Desktop/0.2.13 (darwin; arm64)"}
 
 func (c *Client) identity() Identity {
 	id := c.Identity
 	if id.CLIVersion == "" {
 		id.CLIVersion = DefaultIdentity.CLIVersion
+	}
+	if id.APIVersion == "" {
+		id.APIVersion = DefaultIdentity.APIVersion
 	}
 	if id.DesktopUA == "" {
 		id.DesktopUA = DefaultIdentity.DesktopUA
@@ -55,21 +61,34 @@ func (c *Client) identity() Identity {
 	return id
 }
 
-// cliUA 是 CLI 的 User-Agent。machineID 是号的固定机器码（空则不带后缀）。
-func (c *Client) cliUA(machineID string) string {
-	v := c.identity().CLIVersion
-	ua := "aws-sdk-rust/1.0.0 ua/2.1 os/other lang/rust api/codewhispererstreaming#" + v + " m/E app/AmazonQ-For-CLI md/appVersion-" + v
-	if machineID != "" {
-		ua += "-" + machineID
+// cliOS 是 kiro-cli UA 里的 os/… 值。
+func cliOS() string {
+	switch runtime.GOOS {
+	case "darwin":
+		return "macos"
+	case "windows":
+		return "windows"
 	}
-	return ua
+	return "linux"
 }
 
-// cliHeaders 是 CLI 身份的请求头（User-Agent 与 x-amz-user-agent 相同）。
-func (c *Client) cliHeaders(h http.Header, machineID string) {
-	ua := c.cliUA(machineID)
+// cliUA 是 kiro-cli 2.x 的 User-Agent 与 x-amz-user-agent：两者不同，后者不带 appVersion、带 m/F。
+func (c *Client) cliUA() (ua, amz string) {
+	id := c.identity()
+	base := "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/" + id.APIVersion + " os/" + cliOS() + " lang/rust/1.92.0"
+	return base + " md/appVersion-" + id.CLIVersion + " app/AmazonQ-For-CLI", base + " m/F app/AmazonQ-For-CLI"
+}
+
+// cliHeaders 是 CLI 身份的请求头。
+func (c *Client) cliHeaders(h http.Header) {
+	ua, amz := c.cliUA()
 	h.Set("User-Agent", ua)
-	h.Set("x-amz-user-agent", ua)
+	h.Set("x-amz-user-agent", amz)
+}
+
+func (c *Client) cliHeaderMap() map[string]string {
+	ua, amz := c.cliUA()
+	return map[string]string{"User-Agent": ua, "x-amz-user-agent": amz}
 }
 
 // NewMachineID 生成一个机器码：32 位十六进制。
@@ -272,7 +291,7 @@ func (c *Client) Refresh(ctx context.Context, cred Cred) (Cred, error) {
 		err = c.postJSON(ctx, c.OIDCURL(region)+"/token", map[string]string{
 			"clientId": cred.ClientID, "clientSecret": cred.ClientSecret,
 			"refreshToken": cred.RefreshToken, "grantType": "refresh_token",
-		}, map[string]string{"User-Agent": c.cliUA(cred.MachineID), "x-amz-user-agent": c.cliUA(cred.MachineID)}, &out)
+		}, c.cliHeaderMap(), &out)
 	case MethodExternalIdP:
 		if cred.TokenURL == "" {
 			return cred, &Error{Message: "external IdP has no token URL", Gone: true}
@@ -326,7 +345,7 @@ func (c *Client) Profile(ctx context.Context, cred Cred) (string, error) {
 		}
 		h := http.Header{}
 		cred.setAuth(h)
-		c.cliHeaders(h, cred.MachineID)
+		c.cliHeaders(h)
 		h.Set("X-Amz-Target", "AmazonCodeWhispererService.GetProfile")
 		if err := c.do(ctx, http.MethodPost, c.ManagementURL("us-east-1")+"/", "application/x-amz-json-1.0", strings.NewReader("{}"), h, &out); err != nil {
 			return "", err
@@ -348,7 +367,7 @@ func (c *Client) Profile(ctx context.Context, cred Cred) (string, error) {
 		}
 		h := http.Header{}
 		cred.setAuth(h)
-		c.cliHeaders(h, cred.MachineID)
+		c.cliHeaders(h)
 		err := c.do(ctx, http.MethodPost, c.ManagementURL(region)+"/List-Available-Profiles", "application/json", strings.NewReader("{}"), h, &out)
 		if err == nil {
 			for _, p := range out.Profiles {
@@ -629,7 +648,7 @@ func (c *Client) generate(ctx context.Context, cred Cred, payload []byte) (*http
 		return nil, err
 	}
 	cred.setAuth(req.Header)
-	c.cliHeaders(req.Header, cred.MachineID)
+	c.cliHeaders(req.Header)
 	for k, v := range map[string]string{
 		"Content-Type":                "application/json",
 		"Accept":                      "application/vnd.amazon.eventstream",
@@ -646,7 +665,7 @@ func (c *Client) generate(ctx context.Context, cred Cred, payload []byte) (*http
 func (c *Client) management(ctx context.Context, cred Cred, method string, q url.Values, out any) error {
 	h := http.Header{}
 	cred.setAuth(h)
-	c.cliHeaders(h, cred.MachineID)
+	c.cliHeaders(h)
 	u := c.ManagementURL(cred.APIRegion()) + "/" + method + "?" + q.Encode()
 	return c.do(ctx, http.MethodGet, u, "", nil, h, out)
 }

@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -34,6 +35,7 @@ type fakeKiro struct {
 	// replyHeader 加在非 200 响应上
 	replyHeader http.Header
 	refreshes   int
+	limitsFor   []string // Get-Usage-Limits 请求的 token
 	// hangups 是接下来要直接关连接、不回任何字节的请求数（模拟空闲连接被对端关掉）
 	hangups int
 }
@@ -121,6 +123,9 @@ func (f *fakeKiro) handler(t *testing.T) http.Handler {
 		io.WriteString(w, `{"models":[{"modelId":"claude-sonnet-4.5","modelName":"Sonnet","tokenLimits":{"maxInputTokens":200000}}],"defaultModel":{"modelId":"claude-sonnet-4.5"}}`)
 	})
 	mux.HandleFunc("GET /mgmt/{region}/Get-Usage-Limits", func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		f.limitsFor = append(f.limitsFor, strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+		f.mu.Unlock()
 		io.WriteString(w, `{}`)
 	})
 	// refresh：把 tokN 换成 tokN（同一个号的身份不变，便于断言），记下次数
@@ -373,6 +378,38 @@ func TestQuotaFailoverRepinsAndRotatesConversation(t *testing.T) {
 	}
 	if v, _ := h.pool.Get("a" + strings.TrimPrefix(firstTok, "tok")); v.CooldownUntil.Before(time.Now().Add(30 * time.Minute)) {
 		t.Fatal("quota-exhausted account must cool down")
+	}
+}
+
+// 额度只在号报用尽时查，且只查那一个号；成功的请求不查。
+func TestQuotaFailureChecksOnlyThatAccount(t *testing.T) {
+	h := newHarness(t, 3, nil)
+	h.post(t, "/v1/messages", fmt.Sprintf(turn1, "a"), nil)
+	firstTok := h.up.tokens()[0]
+	h.up.reply = func(token string) (int, string) {
+		if token == firstTok {
+			return 400, `{"message":"limit","reason":"MONTHLY_REQUEST_COUNT"}`
+		}
+		return 200, ""
+	}
+	h.post(t, "/v1/messages", fmt.Sprintf(turn2, "a"), nil)
+	deadline := time.Now().Add(2 * time.Second)
+	var got []string
+	for time.Now().Before(deadline) {
+		h.up.mu.Lock()
+		got = slices.Clone(h.up.limitsFor)
+		h.up.mu.Unlock()
+		if len(got) > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	time.Sleep(50 * time.Millisecond) // 给可能的多余查询一点时间暴露出来
+	h.up.mu.Lock()
+	got = slices.Clone(h.up.limitsFor)
+	h.up.mu.Unlock()
+	if len(got) != 1 || got[0] != firstTok {
+		t.Fatalf("usage-limit queries = %v, want exactly one for %s", got, firstTok)
 	}
 }
 

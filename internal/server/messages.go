@@ -319,6 +319,9 @@ func (s *Server) dispatch(w http.ResponseWriter, r *http.Request, c *call) {
 		c.entry.Account, c.entry.Pinned = lease.ID, lease.Pinned
 		out := s.attempt(ctx, w, lease, c)
 		lease.Release()
+		if out.failure != nil && out.failure.Class == kiro.ClassQuota {
+			s.checkQuota(lease.ID)
+		}
 		if out.done || ctx.Err() != nil {
 			if ctx.Err() != nil && c.entry.Status == 0 {
 				c.entry.Status, c.entry.Error = statusClientClosed, "client went away"
@@ -534,6 +537,9 @@ func (s *Server) attempt(ctx context.Context, w http.ResponseWriter, lease *pool
 		// 流式中途失败：下游已收到 error 事件，这里记到号上（限流冷却 / 统计）
 		note(*out.failure)
 		s.pool.Fail(id, *out.failure)
+		if out.failure.Class == kiro.ClassQuota {
+			s.checkQuota(id)
+		}
 	default:
 		gone()
 	}

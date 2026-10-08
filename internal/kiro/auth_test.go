@@ -492,7 +492,7 @@ func TestGenerate(t *testing.T) {
 			if !uuidRe.MatchString(h.Get("amz-sdk-invocation-id")) {
 				t.Errorf("invocation id = %q", h.Get("amz-sdk-invocation-id"))
 			}
-			if ua := h.Get("User-Agent"); !strings.HasPrefix(ua, "aws-sdk-rust/") || ua != h.Get("x-amz-user-agent") {
+			if ua := h.Get("User-Agent"); !strings.HasPrefix(ua, "aws-sdk-rust/") || !strings.HasPrefix(h.Get("x-amz-user-agent"), "aws-sdk-rust/") {
 				t.Errorf("user agents = %q / %q", ua, h.Get("x-amz-user-agent"))
 			}
 		})
@@ -597,7 +597,7 @@ func TestRefreshIdCClientExpired(t *testing.T) {
 	}
 }
 
-// 对话、OIDC 刷新、management 调用用同一套 CLI 身份；机器码取自凭证，固定；版本可配。
+// 对话、OIDC 刷新、management 调用用同一套 kiro-cli 2.x 身份；版本可配。
 func TestCLIIdentityEverywhere(t *testing.T) {
 	var uas []string
 	f, c := newFake(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
@@ -612,7 +612,7 @@ func TestCLIIdentityEverywhere(t *testing.T) {
 		}
 	})
 	_ = f
-	c.Identity = Identity{CLIVersion: "9.9.9"}
+	c.Identity = Identity{CLIVersion: "9.9.9", APIVersion: "0.1.1"}
 	cred := Cred{Method: MethodIDC, AccessToken: "a", RefreshToken: "r", ClientID: "c", ClientSecret: "s", MachineID: "0123456789abcdef0123456789abcdef"}
 	if _, err := c.Refresh(t.Context(), cred); err != nil {
 		t.Fatal(err)
@@ -627,13 +627,14 @@ func TestCLIIdentityEverywhere(t *testing.T) {
 	res.Body.Close()
 	res, _ = c.Generate(t.Context(), cred, []byte(`{}`))
 	res.Body.Close()
-	want := "aws-sdk-rust/1.0.0 ua/2.1 os/other lang/rust api/codewhispererstreaming#9.9.9 m/E app/AmazonQ-For-CLI md/appVersion-9.9.9-0123456789abcdef0123456789abcdef"
+	base := "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.1 os/" + cliOS() + " lang/rust/1.92.0"
+	want := base + " md/appVersion-9.9.9 app/AmazonQ-For-CLI | " + base + " m/F app/AmazonQ-For-CLI"
 	if len(uas) != 4 {
 		t.Fatalf("requests %v", uas)
 	}
 	for _, ua := range uas {
-		if ua != want+" | "+want {
-			t.Errorf("ua = %q, want CLI identity with fixed machine id", ua)
+		if ua != want {
+			t.Errorf("ua = %q, want %q", ua, want)
 		}
 	}
 }

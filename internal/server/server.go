@@ -51,6 +51,7 @@ type Server struct {
 
 	catalogBusy sync.Mutex
 	priceBusy   sync.Mutex
+	quotaBusy   sync.Map        // 正在查额度的号（同一号额度用尽时并发失败只查一次）
 	priceErr    atomicString    // 上次在线价格拉取的错误（部分来源失败也记）
 	bg          context.Context // 后台任务的生命周期
 	bgWG        sync.WaitGroup  // 需要在退出前收尾的后台任务（最后一次落盘）
@@ -309,6 +310,25 @@ func requestToken(r *http.Request, header string) string {
 		return strings.TrimSpace(v)
 	}
 	return ""
+}
+
+// checkQuota 在一个号报额度用尽后异步查一次它的额度：拿到重置时间，号池就冷却到重置。
+// 这是除加号 / 管理台手动外唯一查额度的地方，不再定时轮询所有号。
+func (s *Server) checkQuota(id string) {
+	if _, busy := s.quotaBusy.LoadOrStore(id, struct{}{}); busy {
+		return
+	}
+	go func() {
+		defer s.quotaBusy.Delete(id)
+		ctx, cancel := context.WithTimeout(s.bg, time.Minute)
+		defer cancel()
+		l, err := s.pool.RefreshLimits(ctx, id)
+		if err != nil {
+			s.log.Warn("usage limits after quota failure", "account", id, "err", err)
+			return
+		}
+		s.log.Info("usage limits after quota failure", "account", id, "used", l.Used, "limit", l.Limit, "reset_at", l.ResetAt)
+	}()
 }
 
 // ensureCatalog 在模型列表过期时异步刷新，不阻塞请求。
