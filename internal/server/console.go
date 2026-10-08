@@ -4,9 +4,11 @@ import (
 	"cmp"
 	"context"
 	_ "embed"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -119,10 +121,12 @@ type loginState struct {
 }
 
 // loginJob 保证同时只有一次浏览器登录：回调端口是固定的那几个。
+// 服务器上浏览器回调不到本进程，另提供 Submit 手工提交回调 URL。
 type loginJob struct {
 	mu     sync.Mutex
 	state  loginState
 	cancel context.CancelFunc
+	manual chan kiro.Callback
 }
 
 func (j *loginJob) get() loginState {
@@ -155,10 +159,61 @@ func (s *Server) adminLogin(w http.ResponseWriter, r *http.Request) {
 		s.login.mu.Unlock()
 		writeJSON(w, http.StatusOK, s.login.get())
 	case http.MethodPost:
+		if r.URL.Query().Get("callback") != "" || r.URL.Query().Get("url") != "" {
+			s.submitLoginCallback(w, r)
+			return
+		}
 		s.startLogin(w)
 	default:
 		w.Header().Set("Allow", "GET, POST, DELETE")
 		writeError(w, http.StatusMethodNotAllowed, "use GET, POST or DELETE")
+	}
+}
+
+// submitLoginCallback 接收浏览器地址栏里的回调 URL，
+// 用于服务器上回调到不了本进程的情况。成功即完成登录。
+func (s *Server) submitLoginCallback(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		URL string `json:"url"`
+	}
+	if r.URL.Query().Get("callback") != "" {
+		in.URL = r.URL.Query().Get("callback")
+	} else if r.URL.Query().Get("url") != "" {
+		in.URL = r.URL.Query().Get("url")
+	} else if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&in); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	in.URL = strings.TrimSpace(in.URL)
+	if in.URL == "" {
+		writeError(w, http.StatusBadRequest, "callback URL is required")
+		return
+	}
+
+	s.login.mu.Lock()
+	ch := s.login.manual
+	waiting := s.login.state.State == "waiting"
+	s.login.mu.Unlock()
+	if !waiting || ch == nil {
+		writeError(w, http.StatusConflict, "no sign-in is in progress; start it first")
+		return
+	}
+	reply := make(chan kiro.CallbackResult, 1)
+	select {
+	case ch <- kiro.Callback{URL: in.URL, Reply: reply}:
+	case <-r.Context().Done():
+		return
+	}
+	select {
+	case res := <-reply:
+		if res.Err != nil {
+			writeError(w, http.StatusBadRequest, res.Err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"next_url": res.NextURL, "done": res.Done})
+	case <-time.After(30 * time.Second):
+		writeError(w, http.StatusGatewayTimeout, "sign-in did not answer in time; if it already finished, reload the page")
+	case <-r.Context().Done():
 	}
 }
 
@@ -172,14 +227,15 @@ func (s *Server) startLogin(w http.ResponseWriter) {
 	}
 	ctx, cancel := context.WithCancelCause(s.bg)
 	j.cancel = func() { cancel(errLoginCanceled) }
+	j.manual = make(chan kiro.Callback, 4)
 	j.state = loginState{State: "waiting", StartedAt: time.Now()}
 	j.mu.Unlock()
 
 	opened := make(chan struct{})
 	signIn := s.signIn
 	if signIn == nil {
-		signIn = func(ctx context.Context, open func(string) error) (kiro.Login, error) {
-			return (&kiro.SignIn{Client: s.pool.Client(), Open: open}).Run(ctx)
+		signIn = func(ctx context.Context, open func(string) error, manual <-chan kiro.Callback) (kiro.Login, error) {
+			return (&kiro.SignIn{Client: s.pool.Client(), Open: open, Manual: manual}).Run(ctx)
 		}
 	}
 	go func() {
@@ -189,7 +245,7 @@ func (s *Server) startLogin(w http.ResponseWriter) {
 			j.update(func(st *loginState) { st.URL = u })
 			once.Do(func() { close(opened) })
 			return s.openBrowser(u)
-		})
+		}, j.manual)
 		once.Do(func() { close(opened) })
 		if err == nil {
 			var a pool.Account

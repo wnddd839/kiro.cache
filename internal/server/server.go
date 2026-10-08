@@ -64,8 +64,8 @@ type Server struct {
 	// Version 显示在管理台；由 main 设置。
 	Version string
 
-	// signIn / openBrowser 可替换，测试用。
-	signIn      func(ctx context.Context, open func(string) error) (kiro.Login, error)
+	// signIn / openBrowser 可替换，测试用。signIn 拿到手工回调通道。
+	signIn      func(ctx context.Context, open func(string) error, manual <-chan kiro.Callback) (kiro.Login, error)
 	openBrowser func(string) error
 }
 

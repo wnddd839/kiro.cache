@@ -51,6 +51,27 @@ type SignIn struct {
 	Open      func(url string) error // 打开浏览器；nil 用 OpenBrowser。失败不致命，会打印 URL
 	Timeout   time.Duration          // 0 = SignInTimeout
 	PortalURL string                 // "" = PortalURL
+	// Manual 是手工提交回调的入口。服务器上浏览器被 Kiro 重定向回 localhost 时到不了本进程，
+	// 用户可以把地址栏里的完整回调 URL 贴进来。非 nil 时 Run 同时处理它。
+	Manual <-chan Callback
+}
+
+// Callback 是一次手工提交的回调。URL 是浏览器地址栏里的完整地址（也可只给 ? 后的查询串）。
+// Reply 必须能收一个值；Run 在 nil 与非 nil 之外总会有答复，不会阻塞调用方。
+type Callback struct {
+	URL   string
+	Reply chan<- CallbackResult
+}
+
+// CallbackResult 是一次手工回调的结果。
+//   - Done 为真：登录成功，Login 是结果（Run 随即返回，调用方负责入池）；
+//   - NextURL 非空：还需要打开它继续（Builder ID / IdC 转 AWS 登录）；
+//   - Err 非空：这次回调无效，登录仍在等待，可以再贴一次。
+type CallbackResult struct {
+	Done    bool
+	Login   Login
+	NextURL string
+	Err     error
 }
 
 // Login 是一次成功的浏览器登录。Email / Plan 尽力获取，可能为空。
@@ -70,7 +91,110 @@ type signInResult struct {
 	err   error
 }
 
+// callbackState 是一次登录期间处理回调需要的状态：state / PKCE / 回调地址，以及
+// 从 Kiro 转 AWS 后那一段。
+type callbackState struct {
+	client      *Client
+	state       string
+	verifier    string
+	redirect    string // http://localhost:<port>
+	awsRedirect string // http://127.0.0.1:<port>/oauth/callback
+	aws         awsSignIn
+}
+
+// outcome 是一次回调处理的结果。nextURL 非空表示还要打开它继续（AWS 登录）。
+type outcome struct {
+	login   Login
+	nextURL string
+	err     error
+}
+
+// errForeignCallback 是这个回调不属于本次登录（别人的页面 / 旧标签页 / 贴错 URL）。
+// 不是失败：登录应继续等待正确的回调。
+var errForeignCallback = errors.New("kiro: callback from a different sign-in")
+
+// handle 处理一次回调（本地监听收到的，或手工提交的）。
+func (st *callbackState) handle(ctx context.Context, u *url.URL) outcome {
+	q := u.Query()
+	if e := q.Get("error"); e != "" {
+		return outcome{err: errors.New(cmp.Or(q.Get("error_description"), e))}
+	}
+	var cred Cred
+	switch {
+	case st.aws.state != "" && q.Get("state") == st.aws.state:
+		// 从 AWS 回来
+		code := q.Get("code")
+		if code == "" {
+			return outcome{err: errors.New("AWS sent back no code")}
+		}
+		t, err := signInToken(ctx, st.client, st.client.OIDCURL(st.aws.region)+"/token", map[string]string{
+			"clientId": st.aws.clientID, "clientSecret": st.aws.clientSecret, "grantType": "authorization_code",
+			"redirectUri": st.awsRedirect, "code": code, "codeVerifier": st.aws.verifier,
+		}, "AWS")
+		if err != nil {
+			return outcome{err: err}
+		}
+		cred = Cred{Method: MethodIDC, AccessToken: t.AccessToken, RefreshToken: t.RefreshToken, ExpiresAt: expiry(t.ExpiresIn),
+			Region: st.aws.region, ClientID: st.aws.clientID, ClientSecret: st.aws.clientSecret, ClientSecretExpiresAt: st.aws.clientExpires,
+			BuilderID: strings.EqualFold(st.aws.provider, "BuilderId")}
+	case q.Get("state") != st.state:
+		return outcome{err: errForeignCallback}
+	default:
+		switch opt := q.Get("login_option"); opt {
+		case "google", "github":
+			path := u.Path
+			if path == "" {
+				path = "/oauth/callback"
+			}
+			t, err := signInToken(ctx, st.client, st.client.AuthService+"/oauth/token", map[string]string{
+				"code": q.Get("code"), "code_verifier": st.verifier,
+				"redirect_uri": st.redirect + path + "?login_option=" + opt,
+			}, "Kiro")
+			if err != nil {
+				return outcome{err: err}
+			}
+			cred = Cred{Method: MethodSocial, AccessToken: t.AccessToken, RefreshToken: t.RefreshToken, ExpiresAt: expiry(t.ExpiresIn),
+				Region: "us-east-1", ProfileArn: t.ProfileArn}
+		case "builderid", "awsidc", "internal":
+			// 去 AWS，用为这次登录注册的 client
+			issuer, region := q.Get("issuer_url"), q.Get("idc_region")
+			if issuer == "" || region == "" {
+				return outcome{err: errors.New("Kiro's page didn't say where to sign in at AWS")}
+			}
+			var reg struct {
+				ClientID     string `json:"clientId"`
+				ClientSecret string `json:"clientSecret"`
+				ExpiresAt    int64  `json:"clientSecretExpiresAt"` // Unix 秒
+			}
+			err := signInPost(ctx, st.client, st.client.OIDCURL(region)+"/client/register", map[string]any{
+				"clientName": "Kiro IDE", "clientType": "public", "scopes": signInScopes,
+				"grantTypes": []string{"authorization_code", "refresh_token"}, "redirectUris": []string{"http://127.0.0.1/oauth/callback"},
+				"issuerUrl": issuer,
+			}, &reg)
+			if err == nil && reg.ClientID == "" {
+				err = errors.New("AWS registered no client")
+			}
+			if err != nil {
+				return outcome{err: err}
+			}
+			st.aws = awsSignIn{region: region, clientID: reg.ClientID, clientSecret: reg.ClientSecret, clientExpires: unixOrZero(reg.ExpiresAt),
+				provider: map[string]string{"builderid": "BuilderId", "awsidc": "Enterprise", "internal": "Internal"}[opt],
+				state:    randURL(24), verifier: randURL(48)}
+			a := url.Values{"response_type": {"code"}, "client_id": {st.aws.clientID}, "redirect_uri": {st.awsRedirect},
+				"scopes": {strings.Join(signInScopes, ",")}, "state": {st.aws.state},
+				"code_challenge": {challenge(st.aws.verifier)}, "code_challenge_method": {"S256"}}
+			return outcome{nextURL: st.client.OIDCURL(region) + "/authorize?" + a.Encode()}
+		case "external_idp":
+			return outcome{err: errors.New("a company's own identity provider can't be signed in to here yet; sign in with the Kiro IDE and use import-ide")}
+		default:
+			return outcome{err: fmt.Errorf("Kiro's page came back with a sign-in kiro-proxy doesn't know (%q)", opt)}
+		}
+	}
+	return outcome{login: whoIs(ctx, st.client, cred)}
+}
+
 // Run 监听回调端口、打开登录页，等浏览器回来。ctx 取消或超时则放弃；结束时关闭监听。
+// 服务器上浏览器回调到不了本进程时，可同时用 s.Manual 手工提交回调 URL。
 func (s *SignIn) Run(ctx context.Context) (Login, error) {
 	c := cmp.Or(s.Client, NewClient(nil))
 	ports := s.Ports
@@ -82,9 +206,14 @@ func (s *SignIn) Run(ctx context.Context) (Login, error) {
 		return Login{}, err
 	}
 	port := ln.Addr().(*net.TCPAddr).Port
-	state, verifier := randURL(24), randURL(48)
 	redirect := "http://localhost:" + strconv.Itoa(port)
-	awsRedirect := "http://127.0.0.1:" + strconv.Itoa(port) + "/oauth/callback"
+	st := &callbackState{
+		client:      c,
+		state:       randURL(24),
+		verifier:    randURL(48),
+		redirect:    redirect,
+		awsRedirect: "http://127.0.0.1:" + strconv.Itoa(port) + "/oauth/callback",
+	}
 
 	ctx, cancel := context.WithTimeoutCause(ctx, cmp.Or(s.Timeout, SignInTimeout), errors.New("kiro: the sign-in timed out"))
 	defer cancel()
@@ -92,112 +221,43 @@ func (s *SignIn) Run(ctx context.Context) (Login, error) {
 	var (
 		mu      sync.Mutex // 回调逐个处理
 		waiting = true
-		aws     awsSignIn // Kiro 的页面把浏览器送去 AWS 之后才有
 		done    = make(chan signInResult, 1)
 	)
-	finish := func(r signInResult) {
-		if waiting {
-			waiting = false
-			done <- r
+
+	// settle 在锁内处理一次回调（本地或手工），并在真失败 / 成功时结束登录。
+	// 返回处理结果；errForeignCallback 不结束登录，可以再贴。
+	settle := func(ctx context.Context, u *url.URL) outcome {
+		mu.Lock()
+		defer mu.Unlock()
+		if !waiting {
+			return outcome{err: errors.New("kiro: this sign-in is over")}
 		}
+		out := st.handle(ctx, u)
+		switch {
+		case errors.Is(out.err, errForeignCallback):
+			// 不是本次登录的回调：继续等正确的那个
+		case out.err != nil:
+			waiting = false
+			done <- signInResult{err: errors.New("kiro: sign-in failed: " + strings.TrimPrefix(out.err.Error(), "kiro: "))}
+		case out.nextURL == "":
+			waiting = false
+			done <- signInResult{login: out.login}
+		}
+		return out
 	}
 
 	callback := func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		defer mu.Unlock()
-		q := r.URL.Query()
-		if !waiting {
-			writePage(w, false, "This sign-in is over", "Start it again.")
-			return
-		}
-		fail := func(msg string) {
-			finish(signInResult{err: errors.New("kiro: sign-in failed: " + msg)})
-			writePage(w, false, "Sign-in didn't finish", msg)
-		}
-		if e := q.Get("error"); e != "" {
-			fail(cmp.Or(q.Get("error_description"), e))
-			return
-		}
-		var cred Cred
+		out := settle(r.Context(), r.URL)
 		switch {
-		case aws.state != "" && q.Get("state") == aws.state:
-			// 从 AWS 回来
-			code := q.Get("code")
-			if code == "" {
-				fail("AWS sent back no code")
-				return
-			}
-			t, err := signInToken(r.Context(), c, c.OIDCURL(aws.region)+"/token", map[string]string{
-				"clientId": aws.clientID, "clientSecret": aws.clientSecret, "grantType": "authorization_code",
-				"redirectUri": awsRedirect, "code": code, "codeVerifier": aws.verifier,
-			}, "AWS")
-			if err != nil {
-				fail(err.Error())
-				return
-			}
-			cred = Cred{Method: MethodIDC, AccessToken: t.AccessToken, RefreshToken: t.RefreshToken, ExpiresAt: expiry(t.ExpiresIn),
-				Region: aws.region, ClientID: aws.clientID, ClientSecret: aws.clientSecret, ClientSecretExpiresAt: aws.clientExpires,
-				BuilderID: strings.EqualFold(aws.provider, "BuilderId")}
-		case q.Get("state") != state:
-			// 不是这次登录的：别人的页面，或旧标签页
+		case errors.Is(out.err, errForeignCallback):
 			writePage(w, false, "This link isn't from this sign-in", "Start it again.")
-			return
+		case out.err != nil:
+			writePage(w, false, "Sign-in didn't finish", strings.TrimPrefix(out.err.Error(), "kiro: "))
+		case out.nextURL != "":
+			http.Redirect(w, r, out.nextURL, http.StatusFound)
 		default:
-			switch opt := q.Get("login_option"); opt {
-			case "google", "github":
-				t, err := signInToken(r.Context(), c, c.AuthService+"/oauth/token", map[string]string{
-					"code": q.Get("code"), "code_verifier": verifier,
-					"redirect_uri": redirect + r.URL.Path + "?login_option=" + opt,
-				}, "Kiro")
-				if err != nil {
-					fail(err.Error())
-					return
-				}
-				cred = Cred{Method: MethodSocial, AccessToken: t.AccessToken, RefreshToken: t.RefreshToken, ExpiresAt: expiry(t.ExpiresIn),
-					Region: "us-east-1", ProfileArn: t.ProfileArn}
-			case "builderid", "awsidc", "internal":
-				// 去 AWS，用为这次登录注册的 client
-				issuer, region := q.Get("issuer_url"), q.Get("idc_region")
-				if issuer == "" || region == "" {
-					fail("Kiro's page didn't say where to sign in at AWS")
-					return
-				}
-				var reg struct {
-					ClientID     string `json:"clientId"`
-					ClientSecret string `json:"clientSecret"`
-					ExpiresAt    int64  `json:"clientSecretExpiresAt"` // Unix 秒
-				}
-				err := signInPost(r.Context(), c, c.OIDCURL(region)+"/client/register", map[string]any{
-					"clientName": "Kiro IDE", "clientType": "public", "scopes": signInScopes,
-					"grantTypes": []string{"authorization_code", "refresh_token"}, "redirectUris": []string{"http://127.0.0.1/oauth/callback"},
-					"issuerUrl": issuer,
-				}, &reg)
-				if err == nil && reg.ClientID == "" {
-					err = errors.New("AWS registered no client")
-				}
-				if err != nil {
-					fail(err.Error())
-					return
-				}
-				aws = awsSignIn{region: region, clientID: reg.ClientID, clientSecret: reg.ClientSecret, clientExpires: unixOrZero(reg.ExpiresAt),
-					provider: map[string]string{"builderid": "BuilderId", "awsidc": "Enterprise", "internal": "Internal"}[opt],
-					state:    randURL(24), verifier: randURL(48)}
-				a := url.Values{"response_type": {"code"}, "client_id": {aws.clientID}, "redirect_uri": {awsRedirect},
-					"scopes": {strings.Join(signInScopes, ",")}, "state": {aws.state},
-					"code_challenge": {challenge(aws.verifier)}, "code_challenge_method": {"S256"}}
-				http.Redirect(w, r, c.OIDCURL(region)+"/authorize?"+a.Encode(), http.StatusFound)
-				return
-			case "external_idp":
-				fail("A company's own identity provider can't be signed in to here yet; sign in with the Kiro IDE and use import-ide")
-				return
-			default:
-				fail(fmt.Sprintf("Kiro's page came back with a sign-in kiro-proxy doesn't know (%q)", opt))
-				return
-			}
+			writePage(w, true, "You're signed in", cmp.Or(out.login.Email, "Kiro account")+" is signed in. You can close this tab.")
 		}
-		login := whoIs(r.Context(), c, cred)
-		finish(signInResult{login: login})
-		writePage(w, true, "You're signed in", cmp.Or(login.Email, "Kiro account")+" is signed in. You can close this tab.")
 	}
 
 	mux := http.NewServeMux()
@@ -211,7 +271,41 @@ func (s *SignIn) Run(ctx context.Context) (Login, error) {
 		_ = srv.Shutdown(sctx) // 等正在写的结果页写完，并关闭监听
 	}()
 
-	q := url.Values{"state": {state}, "code_challenge": {challenge(verifier)}, "code_challenge_method": {"S256"},
+	// 手工回调：服务器上浏览器回不到本进程时，用户把回调 URL 贴进来。
+	if s.Manual != nil {
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case cb, ok := <-s.Manual:
+					if !ok {
+						return
+					}
+					reply := cb.Reply
+					u, err := parseCallbackURL(cb.URL)
+					if err != nil {
+						sendCallback(ctx, reply, CallbackResult{Err: err})
+						continue
+					}
+					out := settle(ctx, u)
+					res := CallbackResult{Err: out.err}
+					switch {
+					case errors.Is(out.err, errForeignCallback):
+						// 不是本次登录的回调：不结束，允许再贴一次
+						res.Err = errors.New("this link isn't from this sign-in; start it again and paste the newest callback URL")
+					case out.err == nil && out.nextURL != "":
+						res = CallbackResult{NextURL: out.nextURL}
+					case out.err == nil:
+						res = CallbackResult{Done: true, Login: out.login}
+					}
+					sendCallback(ctx, reply, res)
+				}
+			}
+		}()
+	}
+
+	q := url.Values{"state": {st.state}, "code_challenge": {challenge(st.verifier)}, "code_challenge_method": {"S256"},
 		"redirect_uri": {redirect}, "redirect_from": {"KiroIDE"}}
 	portal := strings.TrimSuffix(cmp.Or(s.PortalURL, PortalURL), "/") + "/signin?" + q.Encode()
 	open := s.Open
@@ -236,6 +330,39 @@ func (s *SignIn) Run(ctx context.Context) (Login, error) {
 			return Login{}, context.Cause(ctx)
 		}
 	}
+}
+
+// sendCallback 给手工回调回一个结果，收方未读或已取消也不阻塞 Run。
+func sendCallback(ctx context.Context, reply chan<- CallbackResult, res CallbackResult) {
+	if reply == nil {
+		return
+	}
+	select {
+	case reply <- res:
+	case <-ctx.Done():
+	}
+}
+
+// parseCallbackURL 解析手工提交的回调地址。允许完整 URL，或只给 ? 后的查询串、
+// 乃至裸的 code=…&state=…。
+func parseCallbackURL(raw string) (*url.URL, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, errors.New("paste the full callback URL from the browser's address bar")
+	}
+	if u, err := url.Parse(raw); err == nil && u.Scheme != "" && u.Host != "" {
+		q := u.Query()
+		if q.Get("code") == "" && q.Get("state") == "" && q.Get("error") == "" {
+			return nil, errors.New("that URL has no callback parameters; paste the full address from the browser's address bar")
+		}
+		return u, nil
+	}
+	trimmed := strings.TrimPrefix(raw, "?")
+	q, err := url.ParseQuery(trimmed)
+	if err != nil || (q.Get("code") == "" && q.Get("state") == "" && q.Get("error") == "") {
+		return nil, errors.New("that doesn't look like a callback URL; paste the full address from the browser's address bar")
+	}
+	return &url.URL{Path: "/oauth/callback", RawQuery: trimmed}, nil
 }
 
 // listenCallback 在 127.0.0.1 上监听第一个空闲端口。

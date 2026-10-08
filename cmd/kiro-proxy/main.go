@@ -2,12 +2,13 @@
 //
 //	kiro-proxy [-config kiro-proxy.json]                启动服务
 //	kiro-proxy -config kiro-proxy.json import-ide        把 Kiro IDE 当前登录加入号池
-//	kiro-proxy -config kiro-proxy.json login             浏览器登录 Kiro（Google / GitHub / Builder ID / IdC）并加入号池
+//	kiro-proxy -config kiro-proxy.json login             浏览器登录 Kiro（Google / GitHub / Builder ID / IdC）并加入号池；服务器上可粘贴回调地址
 //	kiro-proxy -config kiro-proxy.json list              列出号池
 //	kiro-proxy -config kiro-proxy.json probe <exp>       探测 Kiro 缓存 / 计费行为（usage | ttl | cachepoint | credits | all | analyze）
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -18,6 +19,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -218,13 +220,17 @@ func importIDE(p *pool.Pool) error {
 func login(p *pool.Pool) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	manual := make(chan kiro.Callback, 4)
 	s := &kiro.SignIn{
 		Client: p.Client(),
+		Manual: manual,
 		Open: func(u string) error {
 			fmt.Printf("sign in to Kiro in your browser:\n%s\n", u)
 			return kiro.OpenBrowser(u)
 		},
 	}
+	// 服务器上浏览器回调到不了本进程：让用户在终端粘贴地址栏里的回调 URL。
+	go promptCallbacks(ctx, manual)
 	l, err := s.Run(ctx)
 	if err != nil {
 		return err
@@ -246,6 +252,46 @@ func login(p *pool.Pool) error {
 	}
 	fmt.Printf("added %s  %s  %s  %.1f/%.0f credits\n", a.ID, lim.Email, lim.Plan, lim.Used, lim.Limit)
 	return nil
+}
+
+// promptCallbacks 读终端输入的回调地址（也可只粘贴 ? 后的查询串）交给登录流程。
+// 服务器上没有浏览器回调时用；本机登录不需要，直接回车跳过。
+func promptCallbacks(ctx context.Context, manual chan<- kiro.Callback) {
+	fmt.Println("if the browser can't reach this machine (e.g. on a server), paste the full callback URL here; otherwise press Enter to skip")
+	sc := bufio.NewScanner(os.Stdin)
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		if !sc.Scan() {
+			return
+		}
+		line := strings.TrimSpace(sc.Text())
+		if line == "" {
+			continue
+		}
+		reply := make(chan kiro.CallbackResult, 1)
+		select {
+		case manual <- kiro.Callback{URL: line, Reply: reply}:
+		case <-ctx.Done():
+			return
+		}
+		select {
+		case res := <-reply:
+			switch {
+			case res.Done:
+				fmt.Println("got it; finishing sign-in...")
+				return
+			case res.NextURL != "":
+				fmt.Printf("open this to continue signing in at AWS:\n%s\n", res.NextURL)
+				_ = kiro.OpenBrowser(res.NextURL)
+			case res.Err != nil:
+				fmt.Printf("that callback didn't work: %v\n", res.Err)
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
 // keysConfigured 报告 key 库里是否有 key：有就会校验下游。

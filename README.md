@@ -84,6 +84,11 @@ bin/kiro-proxy.exe -version
 
 `login` 需要 IDE 的回调端口（3128、4649…）空闲，登录前关掉 Kiro IDE 的登录页。公司自建 IdP（external_idp）暂不支持。
 
+**在服务器上登录：** 回调固定打向 `localhost` 端口，到不了服务器进程，所以两边都支持「粘贴回调地址」：
+
+- **CLI**：运行 `kiro-proxy login`，终端会提示粘贴回调 URL；浏览器完成登录后，把地址栏里以 `oauth/callback` 结尾的整条地址粘回去（也可以只粘 `?` 后的部分）。
+- **管理台**：号池页「开始登录」后，会出现「粘贴回调地址」输入框，贴上同一条 URL 提交即可。Builder ID / IdC 会先返回一个 AWS 登录链接，跟着打开、完成后再次粘贴回调。
+
 > **同一个 Kiro 账号只走一条路。** `login` 加的号自己持有 refresh token，不写回任何文件；`import-ide` 加的号刷新后会写回 IDE 的 token 文件。
 > 若同一个账号两种加法的记录都在池里（或 IDE 里仍登录着它），两边各自 refresh 会使对方的 refresh token 失效，表现为该号被自动停用并记 `sign-in expired`。加号前先 `kiro-proxy list` 看池里有没有同一邮箱的号。
 
@@ -129,6 +134,7 @@ export OPENAI_BASE_URL=http://127.0.0.1:8787/v1
 - 路径前缀容错：`/messages`、`/v1/v1/messages`、`/anthropic/v1/messages`、尾 `/`、重复 `/` 都落到同一 handler
 - `GET/POST /admin/accounts`、`DELETE /admin/accounts/{id}`、`POST /admin/accounts/{id}/{enable|disable|refresh}`
 - `POST /admin/accounts/batch` `{"action":"test|limits|refresh|enable|disable|delete","ids":[]}`（ids 空 = 全部，delete 必须给 ids）
+- `GET/POST/DELETE /admin/login`：浏览器登录状态 / 发起 / 取消；`POST /admin/login?callback=<url>` 在服务器上手工提交回调地址
 - `GET/POST/PATCH/DELETE /admin/keys`（下游 key 库，只存 sha256）
 - `GET /admin/usage?from&to&key&account&model&protocol&status&bucket&page&page_size`、`GET /admin/billing?from&to`（默认本月）、`GET /admin/prices`、`POST /admin/prices/refresh`、`GET /admin/models`、`POST /admin/models/refresh`；时间可写 RFC3339、`YYYY-MM-DD` 或 `24h` / `7d`
 

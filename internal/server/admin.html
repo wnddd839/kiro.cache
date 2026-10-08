@@ -354,12 +354,20 @@ pre{
       <div class="ops">
         <div>
           <label>浏览器登录</label>
-          <p class="hint" style="margin-top:0">服务端在本机打开登录页（IDE 式 OAuth），完成后自动入池。</p>
+          <p class="hint" style="margin-top:0">本机运行时直接打开登录页（IDE 式 OAuth），完成自动入池。服务器上浏览器回调到不了本服务，用下方「粘贴回调地址」把地址栏里的完整 URL 贴回来。</p>
           <div class="actions" style="margin-top:10px">
             <button class="primary" type="button" id="btnLogin">开始登录</button>
             <button type="button" id="btnLoginCancel" hidden>取消登录</button>
           </div>
           <div class="box" id="loginBox" hidden><div class="title">登录状态</div><div class="msg" id="loginMsg"></div></div>
+          <div class="box" id="loginManualBox" hidden>
+            <div class="title">粘贴回调地址</div>
+            <div class="msg">服务器上登录时，浏览器会停在回调页（地址以 <span class="mono">oauth/callback</span> 结尾）。把那整条地址粘到这里提交。</div>
+            <input type="text" class="mono" id="loginCallback" placeholder="http://localhost:3128/oauth/callback?login_option=github&code=…&state=…" autocomplete="off" spellcheck="false">
+            <div class="actions" style="margin-top:8px">
+              <button class="primary" type="button" id="btnSubmitCallback">提交回调</button>
+            </div>
+          </div>
         </div>
         <div>
           <label for="importPath">导入 IDE 凭证</label>
@@ -1114,9 +1122,11 @@ function importIDE(){
 function renderLogin(s){
   s = s || { state: 'idle' };
   var box = $('loginBox'), msg = $('loginMsg');
+  var manual = $('loginManualBox');
   var waiting = s.state === 'waiting';
   $('btnLogin').disabled = waiting;
   $('btnLoginCancel').hidden = !waiting;
+  manual.hidden = !waiting;
   if (s.state === 'idle') { box.hidden = true; return; }
   box.hidden = false;
   if (waiting) {
@@ -1130,6 +1140,22 @@ function renderLogin(s){
   } else {
     msg.textContent = s.state;
   }
+}
+function submitLoginCallback(){
+  var url = $('loginCallback').value.trim();
+  if (!url) { toast('先粘贴浏览器地址栏里的回调地址', true); return; }
+  var btn = $('btnSubmitCallback');
+  btn.disabled = true;
+  api('POST', '/admin/login?callback=' + encodeURIComponent(url), null).then(function(d){
+    $('loginCallback').value = '';
+    if (d && d.next_url) {
+      toast('继续在浏览器打开 AWS 登录，完成后再次粘贴回调地址');
+      window.open(d.next_url, '_blank', 'noopener');
+    } else {
+      toast('回调已提交');
+    }
+    loadLogin(false);
+  }).catch(function(){ loadLogin(false); }).then(function(){ btn.disabled = false; });
 }
 function stopLoginPoll(){
   if (state.loginTimer) { clearTimeout(state.loginTimer); state.loginTimer = null; }
@@ -1696,6 +1722,7 @@ $('btnAdd').addEventListener('click', addCredential);
 $('btnImport').addEventListener('click', importIDE);
 $('btnLogin').addEventListener('click', startLogin);
 $('btnLoginCancel').addEventListener('click', cancelLogin);
+$('btnSubmitCallback').addEventListener('click', submitLoginCallback);
 $('accounts').addEventListener('change', function(e){
   var id = e.target.getAttribute && e.target.getAttribute('data-pick');
   if (!id) return;

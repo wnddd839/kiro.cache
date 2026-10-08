@@ -22,7 +22,7 @@ import (
 //	GET    /admin/overview                 管理台首页汇总
 //	GET    /admin/requests?limit=N         最近请求（每次上游尝试一条）
 //	GET    /admin/models                   模型目录；POST /admin/models/refresh 重拉
-//	GET|POST|DELETE /admin/login           浏览器登录：状态 / 发起 / 取消
+//	GET|POST|DELETE /admin/login           浏览器登录：状态 / 发起 / 取消；POST ?callback=<url> 手工提交回调
 //
 // key、用量、账单、批量操作见 billingRoutes。
 func (s *Server) adminMux() *http.ServeMux {

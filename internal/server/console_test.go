@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -224,7 +225,7 @@ func TestAdminLoginAddsAccount(t *testing.T) {
 	h := newHarness(t, 0, nil)
 	release := make(chan struct{})
 	h.s.openBrowser = func(string) error { return nil }
-	h.s.signIn = func(ctx context.Context, open func(string) error) (kiro.Login, error) {
+	h.s.signIn = func(ctx context.Context, open func(string) error, manual <-chan kiro.Callback) (kiro.Login, error) {
 		_ = open("https://app.kiro.dev/signin?x")
 		<-release
 		return kiro.Login{Email: "me@x.com", Cred: kiro.Cred{Method: kiro.MethodSocial, AccessToken: "new", RefreshToken: "r",
@@ -252,7 +253,7 @@ func TestAdminLoginAddsAccount(t *testing.T) {
 func TestAdminLoginCancel(t *testing.T) {
 	h := newHarness(t, 0, nil)
 	h.s.openBrowser = func(string) error { return nil }
-	h.s.signIn = func(ctx context.Context, open func(string) error) (kiro.Login, error) {
+	h.s.signIn = func(ctx context.Context, open func(string) error, _ <-chan kiro.Callback) (kiro.Login, error) {
 		_ = open("u")
 		<-ctx.Done()
 		return kiro.Login{}, context.Cause(ctx)
@@ -266,7 +267,7 @@ func TestAdminLoginCancel(t *testing.T) {
 		t.Fatalf("cancel = %+v", st)
 	}
 	// 取消后可以重新发起
-	h.s.signIn = func(context.Context, func(string) error) (kiro.Login, error) {
+	h.s.signIn = func(context.Context, func(string) error, <-chan kiro.Callback) (kiro.Login, error) {
 		return kiro.Login{}, errors.New("ports busy")
 	}
 	status, body := h.do(t, http.MethodPost, "/admin/login", nil)
@@ -275,5 +276,52 @@ func TestAdminLoginCancel(t *testing.T) {
 	}
 	if st := waitLogin(t, h, "failed"); st.Error != "ports busy" {
 		t.Fatalf("restart failed = %+v", st)
+	}
+}
+
+// 服务器场景：登录进行中，通过管理接口粘贴回调 URL，走手工通道完成入池。
+func TestAdminLoginManualCallback(t *testing.T) {
+	h := newHarness(t, 0, nil)
+	h.s.openBrowser = func(string) error { return nil }
+	h.s.signIn = func(ctx context.Context, open func(string) error, manual <-chan kiro.Callback) (kiro.Login, error) {
+		_ = open("https://app.kiro.dev/signin?x")
+		select {
+		case cb := <-manual:
+			if !strings.Contains(cb.URL, "code=good") {
+				cb.Reply <- kiro.CallbackResult{Err: errors.New("this link isn't from this sign-in")}
+				return kiro.Login{}, errors.New("rejected")
+			}
+			cb.Reply <- kiro.CallbackResult{Done: true}
+			return kiro.Login{Email: "manual@x.com", Cred: kiro.Cred{Method: kiro.MethodSocial, AccessToken: "new", RefreshToken: "r",
+				ExpiresAt: time.Now().Add(time.Hour), ProfileArn: "arn:aws:codewhisperer:us-east-1:1:profile/x"}}, nil
+		case <-ctx.Done():
+			return kiro.Login{}, context.Cause(ctx)
+		}
+	}
+	if status, body := h.do(t, http.MethodPost, "/admin/login", nil); status != http.StatusAccepted {
+		t.Fatalf("start: %d %s", status, body)
+	}
+	// 无进行中的登录时接口拒绝（这里登录进行中，应成功）
+	status, body := h.do(t, http.MethodPost, "/admin/login?callback="+url.QueryEscape("http://localhost:3128/oauth/callback?code=good&state=x"), nil)
+	var res struct {
+		Done    bool   `json:"done"`
+		NextURL string `json:"next_url"`
+	}
+	_ = json.Unmarshal(body, &res)
+	if status != http.StatusOK || !res.Done {
+		t.Fatalf("manual callback: %d %s", status, body)
+	}
+	st := waitLogin(t, h, "done")
+	if st.Email != "manual@x.com" || st.AccountID == "" {
+		t.Fatalf("done = %+v", st)
+	}
+}
+
+// 没有进行中的登录时，粘贴回调返回 409。
+func TestAdminLoginCallbackWithoutJob(t *testing.T) {
+	h := newHarness(t, 0, nil)
+	status, _ := h.do(t, http.MethodPost, "/admin/login?callback="+url.QueryEscape("http://localhost:3128/oauth/callback?code=x&state=y"), nil)
+	if status != http.StatusConflict {
+		t.Fatalf("status = %d, want 409", status)
 	}
 }
