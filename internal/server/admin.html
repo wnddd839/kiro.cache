@@ -123,7 +123,7 @@ button.primary:hover,.btn.primary:hover{opacity:.9;background:var(--invert-bg);c
 button.danger{color:var(--fg-60);border-color:var(--fg-20)}
 button.danger:hover,button.danger.armed{background:var(--invert-bg);color:var(--invert-fg);border-color:var(--invert-bg)}
 label{display:block;font-size:11px;letter-spacing:.18em;text-transform:uppercase;color:var(--fg-40);margin-bottom:6px}
-select,input[type=text],input[type=password],input[type=number]{
+select,input:not([type=checkbox]){
   width:100%;padding:8px 0;border:none;border-bottom:1px solid var(--fg-20);background:transparent;
   color:var(--fg);font-family:var(--sans);font-size:14px;outline:none;transition:border-color 200ms ease;
 }
