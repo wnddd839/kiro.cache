@@ -184,6 +184,12 @@ func TestParseCallbackURL(t *testing.T) {
 		wantErr bool
 	}{
 		{"http://localhost:3128/oauth/callback?code=a&state=b", "code=a&state=b", false},
+		// 实际服务器登录时用户从地址栏复制的那条：端口 3128 + github
+		{
+			"http://localhost:3128/oauth/callback?login_option=github&code=512e26bb-fe9d-4bcd-8ae3-ee513ddd014d&state=8xcOHhHWD2AHh1mjxqW-_bXzpU3-GOxb",
+			"code=512e26bb-fe9d-4bcd-8ae3-ee513ddd014d&login_option=github&state=8xcOHhHWD2AHh1mjxqW-_bXzpU3-GOxb",
+			false,
+		},
 		{"?code=a&state=b", "code=a&state=b", false},
 		{"code=a&state=b", "code=a&state=b", false},
 		{"http://localhost:3128/oauth/callback?error=access_denied", "error=access_denied", false},
