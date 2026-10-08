@@ -83,6 +83,25 @@ func startUsage(in turn.Usage, reportsSeen bool) turn.Usage {
 	return turn.Usage{Input: max(0, in.Input/2-2)}
 }
 
+// reportedUsage 合并上游已报的记账；未报的部分保留本地计量。
+// 首条内容前失败时传入零用量，不能假定本地整段输入已被上游处理。
+func reportedUsage(u turn.Usage, k kiro.Usage, po pumpOpts) turn.Usage {
+	if k.Reported && po.mode != kiro.ReportedIgnore {
+		// 上游不分 TTL：1h 按本地拆分的占比搬到上游的 cacheWrite 上。
+		u.CacheWrite1h = meter.Scale1h(u.CacheWrite1h, u.CacheWrite, k.CacheWrite)
+		in, read := k.Input, k.CacheRead
+		if po.mode != kiro.ReportedRaw {
+			in, read = stripHidden(in, read, po.hidden)
+		}
+		u.Input, u.CacheRead, u.CacheWrite = in, read, k.CacheWrite
+	}
+	if k.OutputReported && po.mode != kiro.ReportedIgnore {
+		u.Output = max(k.Output, u.Reasoning)
+	}
+	u.Credits = k.Credits
+	return u
+}
+
 func pump(ctx context.Context, dec *kiro.Decoder, first kiro.Event, sink turn.Sink, input turn.Usage, settle func(turn.Usage, kiro.Usage) turn.Usage, po pumpOpts) reply {
 	// 开头只报保守的下界，最终值以结尾为准。客户端若把 message_start 的 usage 也计入，不会比最终值多
 	sink.Begin(startUsage(input, po.reportsSeen))
@@ -115,21 +134,7 @@ func pump(ctx context.Context, dec *kiro.Decoder, first kiro.Event, sink turn.Si
 		u := input
 		u.Reasoning = meter.Count(think.String())
 		u.Output = meter.Count(out.String()) + u.Reasoning + tools*toolCallTokens
-		if k.Reported && po.mode != kiro.ReportedIgnore {
-			// 上游报了输入侧真实计数就用它；本地模拟只是 Kiro 不报时的替代。
-			// 上游不分 TTL：1h 按本地拆分的占比搬到上游的 cacheWrite 上
-			in, read := k.Input, k.CacheRead
-			if po.mode != kiro.ReportedRaw {
-				in, read = stripHidden(in, read, po.hidden)
-			}
-			u.Input, u.CacheRead, u.CacheWrite = in, read, k.CacheWrite
-			u.CacheWrite1h = meter.Scale1h(input.CacheWrite1h, input.CacheWrite, k.CacheWrite)
-		}
-		if k.OutputReported && po.mode != kiro.ReportedIgnore {
-			u.Output = max(k.Output, u.Reasoning)
-		}
-		u.Credits = k.Credits
-		return u
+		return reportedUsage(u, k, po)
 	}
 	// partial 在没正常结束时取已消耗的量。先等读协程退出：Decoder 不能并发访问。
 	partial := func(r reply) reply {

@@ -34,9 +34,8 @@ type Usage struct {
 
 	Credits    float64 // meteringEvent 的 usage 之和
 	ContextPct float64 // 上下文占用百分比（含 Kiro 自己的 system）
-	// Reported 表示上游报了输入侧 tokenUsage（uncached / input / cacheRead / cacheWrite 至少一项非零）：
-	// 此时 Input/Cache* 是上游的真实计数，优先于本地模拟。只报 outputTokens（或全 0）不算，
-	// 否则会用 0 覆盖本地拆分并跳过上下文校准。Output 是否可信看 Output > 0。
+	// Reported 表示上游报了输入侧 tokenUsage 字段（uncached / input / cacheRead / cacheWrite）：
+	// 显式 0 也是真实计数；只报 outputTokens 不覆盖本地输入拆分与上下文校准。
 	Reported bool
 	// OutputReported 表示 Output 是上游报的 outputTokens，不是按字符估算的。
 	OutputReported bool
@@ -178,9 +177,10 @@ type Decoder struct {
 	said    int
 	failure string
 
-	lastUsage string // 上一条 tokenUsage 原值
+	lastUsage string           // 上一条 tokenUsage 原值
+	tokens    tokenUsageFields // 输入侧各字段最后一次上报的值，用于推算 uncached
 
-	// Mode 是多条 tokenUsage 的合并方式：只有 ReportedSum 累加，其它都取最后一条。
+	// Mode 是多条 tokenUsage 的合并方式：只有 ReportedSum 累加，其它取各字段最后一次上报的值。
 	Mode string
 
 	// Trace 非 nil 时收到每一帧的事件类型与原始 payload（探测工具用）
@@ -213,7 +213,8 @@ func val(p *int) int {
 
 // tokenUsage 记一条 tokenUsage。
 //
-// 多条时不累加，取最后一条：上游若发的是累计值，累加会多收；若是增量，取最后一条只会少收。
+// 默认不累加，取各字段最后一次上报的值：缺失保留旧值，显式 0 覆盖旧值。
+// 上游若发的是累计值，累加会多收；只有确认是增量后才用 ReportedSum。
 // 每条原值留在 UsageRaw 里，调用方告警并写调试日志。credits（meteringEvent）照常累加。
 //
 // uncachedInputTokens 缺失时用 inputTokens − cacheRead − cacheWrite 推算（inputTokens 可能是含缓存的总输入）；
@@ -237,6 +238,23 @@ func (d *Decoder) tokenUsage(raw json.RawMessage) {
 	if tu.Normalized != nil {
 		d.usage.Normalized = *tu.Normalized
 	}
+	reported := tu.Uncached != nil || tu.Input != nil || tu.CacheRead != nil || tu.CacheWrite != nil
+	if d.Mode != ReportedSum {
+		if tu.Uncached != nil {
+			d.tokens.Uncached = tu.Uncached
+		}
+		if tu.Input != nil {
+			d.tokens.Input = tu.Input
+		}
+		if tu.CacheRead != nil {
+			d.tokens.CacheRead = tu.CacheRead
+		}
+		if tu.CacheWrite != nil {
+			d.tokens.CacheWrite = tu.CacheWrite
+		}
+		tu.Uncached, tu.Input = d.tokens.Uncached, d.tokens.Input
+		tu.CacheRead, tu.CacheWrite = d.tokens.CacheRead, d.tokens.CacheWrite
+	}
 	read, write := val(tu.CacheRead), val(tu.CacheWrite)
 	var in int
 	switch {
@@ -245,15 +263,16 @@ func (d *Decoder) tokenUsage(raw json.RawMessage) {
 	case tu.Input != nil:
 		in = max(0, *tu.Input-read-write)
 	}
-	reported := tu.Uncached != nil || tu.Input != nil || tu.CacheRead != nil || tu.CacheWrite != nil
-	if d.Mode == ReportedSum && d.usage.UsageEvents > 1 {
+	if d.Mode == ReportedSum {
 		d.usage.Input += in
 		d.usage.CacheRead += read
 		d.usage.CacheWrite += write
 		d.usage.Output += val(tu.Output)
 	} else {
 		d.usage.Input, d.usage.CacheRead, d.usage.CacheWrite = in, read, write
-		d.usage.Output = val(tu.Output)
+		if tu.Output != nil {
+			d.usage.Output = *tu.Output
+		}
 	}
 	d.usage.Reported = d.usage.Reported || reported
 	d.usage.OutputReported = d.usage.OutputReported || tu.Output != nil
@@ -263,11 +282,11 @@ func (d *Decoder) tokenUsage(raw json.RawMessage) {
 }
 
 // ReportedMode 是上游报了 tokenUsage 时怎么用它。等 `probe usage` 有结论再定口径；
-// 默认 ReportedConservative：取最后一条、不累加、扣隐藏 token，不会多收。
+// 默认 ReportedConservative：各字段取最后值、不累加、扣隐藏 token。
 const (
-	// ReportedConservative：多条取最后一条；输入侧扣掉 Kiro 隐藏 token（先扣 uncached 再扣 cacheRead）。
+	// ReportedConservative：各字段取最后一次上报的值；输入侧扣掉 Kiro 隐藏 token（先扣 uncached 再扣 cacheRead）。
 	ReportedConservative = "conservative"
-	// ReportedRaw：多条取最后一条；输入侧原样用（确认上游不含隐藏部分后再用）。
+	// ReportedRaw：各字段取最后一次上报的值；输入侧原样用（确认上游不含隐藏部分后再用）。
 	ReportedRaw = "raw"
 	// ReportedSum：多条累加（确认上游发的是增量后再用）；输入侧扣隐藏 token。
 	ReportedSum = "sum"
@@ -328,7 +347,7 @@ func (d *Decoder) finish() {
 	if !u.Reported && u.Input == 0 && d.pct > 0 && d.window > 0 {
 		u.Input = int(math.Round(d.pct / 100 * float64(d.window)))
 	}
-	if u.Output == 0 {
+	if !u.OutputReported && u.Output == 0 {
 		u.Output = (d.said + 3) / 4
 	}
 	stop := "end_turn"

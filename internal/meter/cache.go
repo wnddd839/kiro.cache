@@ -315,7 +315,7 @@ func NewCache(now func() time.Time) *Cache {
 // Peek 只算不写：给预估费用用。
 func (c *Cache) Peek(scope string, p *Prompt) Split { return c.apply(scope, p, false) }
 
-// Commit 计算命中并把断点写入缓存。只在上游成功应答后调用。
+// Commit 计算命中并把断点写入缓存。在成功应答或已确认输入被处理的失败尝试后调用。
 func (c *Cache) Commit(scope string, p *Prompt) Split { return c.apply(scope, p, true) }
 
 func (c *Cache) apply(scope string, p *Prompt, write bool) Split {

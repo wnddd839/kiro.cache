@@ -443,20 +443,33 @@ func (s *Server) attempt(ctx context.Context, w http.ResponseWriter, lease *pool
 	dec := kiro.NewDecoder(res.Body, c.budget > 0, s.models.window(c.model), names)
 	dec.Mode = s.cfg.ReportedUsageMode()
 	first, err := dec.Next()
-	if err == nil && first.Kind == kiro.EvError {
-		f := kiro.ClassifyStream(first.Text)
-		if !s.pool.Fail(id, f) {
-			return terminal(f)
-		}
-		note(f)
-		return outcome{failure: &f}
-	}
 
 	// 输入侧按本地 prompt cache 模拟拆分；缓存跟号走，与上游一致
 	split := s.cache.Peek(id, c.prompt)
 	input := turn.Usage{Input: split.Input, CacheRead: split.CacheRead, CacheWrite: split.CacheWrite, CacheWrite1h: split.CacheWrite1h}
 	po := pumpOpts{hidden: kiro.HiddenTokens(c.model), mode: s.cfg.ReportedUsageMode(),
 		reportsSeen: s.reportsSeen.Load() && s.cfg.ReportedUsageMode() != kiro.ReportedIgnore}
+	if err == nil && first.Kind == kiro.EvError {
+		// 首条内容前也可能已报 credits / tokenUsage，只按已报用量记成本。
+		k := dec.Partial()
+		u := reportedUsage(turn.Usage{}, k, po)
+		u.CacheWrite1h = meter.Scale1h(input.CacheWrite1h, input.CacheWrite, u.CacheWrite)
+		s.noteReported(c, id, input, k)
+		s.charge(id, c, u)
+		spent := u.PromptTokens() > 0 || u.Output > 0 || u.Credits > 0
+		rec.Input, rec.Output, rec.CacheRead, rec.CacheWrite = u.Input, u.Output, u.CacheRead, u.CacheWrite
+		rec.Credits, rec.CostUSD = u.Credits, s.pricer.Cost(c.model, u)
+		f := kiro.ClassifyStream(first.Text)
+		if !s.pool.Fail(id, f) {
+			c.spent, c.aborted = u, spent
+			return terminal(f)
+		}
+		note(f)
+		if spent {
+			s.retried(c, id, f, u, time.Since(rec.Time))
+		}
+		return outcome{failure: &f}
+	}
 	ts := &timingSink{start: c.start}
 	settle := func(u turn.Usage, k kiro.Usage) turn.Usage {
 		s.watchHidden(c.model, u, k) // 用校准前的本地计量反推 Kiro 隐藏 token
@@ -551,8 +564,8 @@ func (s *Server) attempt(ctx context.Context, w http.ResponseWriter, lease *pool
 	return outcome{done: true}
 }
 
-// charge 把一次没有成功的尝试已消耗的量记到号的统计上。上游已经开始回复说明整段前缀已处理，
-// 号上的 prompt cache 也已写入。账本由调用方记（retried 或最终一行）。
+// charge 把一次没有成功的尝试已消耗的量记到号的统计上。有输入用量才写入 prompt cache；
+// 首条内容前只报 credits 不能证明整段前缀已处理。账本由调用方记（retried 或最终一行）。
 // credits 与账本行用同一套估算（estimateCredits），号上的统计与账本一致。
 func (s *Server) charge(id string, c *call, u turn.Usage) {
 	if u.PromptTokens() == 0 && u.Output == 0 && u.Credits == 0 {
@@ -560,7 +573,9 @@ func (s *Server) charge(id string, c *call, u turn.Usage) {
 	}
 	u, est := s.estimateCredits(c.model, u)
 	u = s.priced(c.model, u)
-	s.cache.Commit(id, c.prompt)
+	if u.PromptTokens() > 0 {
+		s.cache.Commit(id, c.prompt)
+	}
 	s.pool.Charge(id, kiro.Usage{Input: u.Input, Output: u.Output, CacheRead: u.CacheRead, CacheWrite: u.CacheWrite, Credits: u.Credits}, u.CostUSD, est)
 }
 

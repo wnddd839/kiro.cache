@@ -121,7 +121,7 @@ func (s *Server) noteReported(c *call, account string, local turn.Usage, k kiro.
 	}
 	s.reportsSeen.Store(true)
 	if k.UsageEvents > 1 {
-		s.log.Warn("upstream sent several tokenUsage in one reply; using the last one (not summed)",
+		s.log.Warn("upstream sent several tokenUsage in one reply; merging with configured mode",
 			"model", c.model, "account", account, "events", k.UsageEvents, "mode", s.cfg.ReportedUsageMode())
 		if k.UsageRaw != nil {
 			for i, raw := range *k.UsageRaw {
