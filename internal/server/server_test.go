@@ -44,6 +44,7 @@ type fakeKiro struct {
 type upstreamCall struct {
 	token string
 	body  map[string]any
+	raw   []byte // 实际收到的请求字节，用于核对调试快照
 }
 
 func (f *fakeKiro) convIDs() []string {
@@ -86,12 +87,16 @@ func (f *fakeKiro) handler(t *testing.T) http.Handler {
 			return
 		}
 		var body map[string]any
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("upstream read: %v", err)
+		}
+		if err := json.Unmarshal(raw, &body); err != nil {
 			t.Errorf("upstream body: %v", err)
 		}
 		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 		f.mu.Lock()
-		f.calls = append(f.calls, upstreamCall{token: token, body: body})
+		f.calls = append(f.calls, upstreamCall{token: token, body: body, raw: raw})
 		f.mu.Unlock()
 		status, errBody := 200, ""
 		if f.reply != nil {

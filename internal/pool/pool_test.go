@@ -317,11 +317,6 @@ func TestAcquirePinnedUnavailableFallsBack(t *testing.T) {
 		{name: "cooling", setup: func(t *testing.T, p *Pool) {
 			p.Fail("a", kiro.Failure{Status: 429, Class: kiro.ClassThrottle})
 		}},
-		{name: "at max concurrent", setup: func(t *testing.T, p *Pool) {
-			p.pinWait = 10 * time.Millisecond
-			p.slotFor(t, "a").acct.MaxConcurrent = 1
-			mustAcquire(t, p, "", "b") // 占满 a
-		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1082,13 +1077,13 @@ func TestAcquirePinnedBusyWaits(t *testing.T) {
 	}()
 	l := mustAcquire(t, p, "sess")
 	defer l.Release()
-	if l.ID != "a" || !l.Pinned || l.Overflow {
+	if l.ID != "a" || !l.Pinned {
 		t.Fatalf("lease = %+v, want a pinned after waiting", l)
 	}
 }
 
-// 等不到：借用别的号并标 Overflow，调用方据此不改钉。
-func TestAcquirePinnedBusyOverflow(t *testing.T) {
+// 等不到时不借号：取消返回 ctx 错误，超时返回可重试的忙状态。
+func TestAcquirePinnedBusyDoesNotSwitch(t *testing.T) {
 	p, _ := openPool(t, nil)
 	mustAdd(t, p, Account{ID: "a", MaxConcurrent: 1, Cred: freshCred("a")})
 	mustAdd(t, p, Account{ID: "b", Cred: freshCred("b")})
@@ -1098,12 +1093,13 @@ func TestAcquirePinnedBusyOverflow(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Millisecond)
 	defer cancel()
 	l, err := p.AcquireContext(ctx, "sess", nil)
-	if err != nil {
-		t.Fatal(err)
+	if err == nil || l != nil || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("canceled wait = %+v %v", l, err)
 	}
-	defer l.Release()
-	if l.ID != "b" || l.Pinned || !l.Overflow {
-		t.Fatalf("lease = %+v, want b overflow", l)
+	p.pinWait = time.Millisecond
+	l, err = p.AcquireContext(t.Context(), "sess", nil)
+	if _, ok := errors.AsType[*UnavailableError](err); !ok || l != nil {
+		t.Fatalf("busy account should remain pinned: %+v %v", l, err)
 	}
 	if id, _ := p.pins.Lookup("sess"); id != "a" {
 		t.Fatalf("pin moved to %s", id)

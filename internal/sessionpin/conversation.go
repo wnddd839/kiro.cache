@@ -25,7 +25,7 @@ type ConversationTable struct {
 	m   map[string]map[string]conversation // 会话键 → 号 → conversation
 }
 
-// NewConversationTable 建表；ttl 非正则回落 45 分钟。
+// NewConversationTable 建表；ttl 非正则回落 24 小时空闲过期。
 func NewConversationTable(ttl time.Duration) *ConversationTable {
 	if ttl <= 0 {
 		ttl = defaultTTL

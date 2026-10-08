@@ -279,7 +279,7 @@ func TestBuildMergesSameRole(t *testing.T) {
 	}
 }
 
-func TestBuildLatestImagesOnly(t *testing.T) {
+func TestBuildHistoryImagesRetained(t *testing.T) {
 	req := parseReq(t, `{"messages":[
 		{"role":"user","content":[{"type":"text","text":"one"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"OLD"}}]},
 		{"role":"assistant","content":"ok"},
@@ -293,8 +293,8 @@ func TestBuildLatestImagesOnly(t *testing.T) {
 	if len(h) != 4 {
 		t.Fatalf("history = %+v", h)
 	}
-	if h[0].User.Images != nil {
-		t.Errorf("older images kept: %+v", h[0].User.Images)
+	if got := h[0].User.Images; len(got) != 1 || got[0].Source.Bytes != "OLD" {
+		t.Errorf("historical images changed: %+v", got)
 	}
 	if got := h[2].User.Images; len(got) != 1 || got[0].Format != "jpeg" || got[0].Source.Bytes != "NEW1" {
 		t.Errorf("latest images = %+v", got)
@@ -341,8 +341,8 @@ func TestBuildTools(t *testing.T) {
 		got = append(got, spec{tl.Spec.Name, tl.Spec.Description, string(tl.Spec.InputSchema.JSON)})
 	}
 	want := []spec{
-		{"read", "Read a file", `{"type":"object","properties":{"p":{"type":"string"}}}`},
-		{"bare", "bare", string(emptySchema)},
+		{"read", "Read a file", `{"properties":{"p":{"type":"string"}},"type":"object"}`},
+		{"bare", "bare", string(anthropic.CanonicalJSON(emptySchema))},
 		{short, "mcp", `{"type":"object"}`},
 		{"gone", "Tool", string(emptySchema)},
 	}

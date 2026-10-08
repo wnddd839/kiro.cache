@@ -100,8 +100,8 @@ func TestReportedCacheWriteKeeps1hShare(t *testing.T) {
 	}
 }
 
-// 钉的号只是并发打满时：借用别的号答复，但会话仍钉在原号。
-func TestOverflowDoesNotRepin(t *testing.T) {
+// 钉住的账号忙时返回重试提示，不借号破坏缓存。
+func TestBusySessionDoesNotSwitchAccount(t *testing.T) {
 	h := newHarness(t, 2, nil)
 	for _, id := range []string{"a0", "a1"} {
 		if err := h.pool.SetMaxConcurrent(id, 1); err != nil {
@@ -121,7 +121,7 @@ func TestOverflowDoesNotRepin(t *testing.T) {
 	t.Cleanup(open)
 	h.up.streamWriter = func(w http.ResponseWriter, r *http.Request) {
 		if strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ") == pinned {
-			// 先发首帧：流式在这时就已钉好，之后才是借用请求
+			// 先发首帧：流式在这时就已钉好，之后发并行请求
 			w.Write(frame("assistantResponseEvent", `{"content":"working "}`))
 			w.(http.Flusher).Flush()
 			select {
@@ -135,7 +135,7 @@ func TestOverflowDoesNotRepin(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		// 流式：开始输出时就已钉好，之后的借用请求若改钉会覆盖它
+		// 流式请求保持占用原号，另一个请求不能借号
 		stream := strings.Replace(fmt.Sprintf(turn2, "a"), `"max_tokens":100`, `"max_tokens":100,"stream":true`, 1)
 		res := h.post(t, "/v1/messages", stream, hdr) // 占住原号
 		_, _ = io.Copy(io.Discard, res.Body)
@@ -144,16 +144,16 @@ func TestOverflowDoesNotRepin(t *testing.T) {
 	for len(h.up.tokens()) < 2 && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
 	}
-	res := h.post(t, "/v1/messages", fmt.Sprintf(turn2, "b"), hdr) // 原号忙：借用
-	if res.StatusCode != 200 {
-		t.Fatal(res.StatusCode)
+	res := h.post(t, "/v1/messages", fmt.Sprintf(turn2, "b"), hdr) // 原号忙：排队超时
+	if res.StatusCode != http.StatusTooManyRequests || res.Header.Get("Retry-After") == "" {
+		t.Fatalf("busy pinned account should request a retry: status %d", res.StatusCode)
 	}
-	if got := res.Header.Get("X-Kiro-Account"); got == "" || "tok"+strings.TrimPrefix(got, "a") == pinned {
-		t.Fatalf("overflow should use the other account, got %s (pinned %s)", got, pinned)
+	if tokens := h.up.tokens(); len(tokens) != 2 {
+		t.Fatalf("busy session borrowed another account: %v", tokens)
 	}
 	open()
 	<-done
-	// 原号空了：下一轮回到原号（借用没有把会话改钉）
+	// 原号空了：下一轮仍使用原号
 	res = h.post(t, "/v1/messages", fmt.Sprintf(turn2, "c"), hdr)
 	if got := res.Header.Get("X-Kiro-Account"); "tok"+strings.TrimPrefix(got, "a") != pinned {
 		t.Fatalf("session re-pinned to %s (pinned token %s)", got, pinned)

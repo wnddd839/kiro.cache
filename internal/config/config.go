@@ -93,7 +93,7 @@ type Config struct {
 	// PricesFile 缓存上次拉到的在线价格；空 = 只在内存。
 	PricesFile string `json:"prices_file"`
 
-	SessionTTL       Duration `json:"session_ttl"`
+	SessionTTL       Duration `json:"session_ttl"` // 无结束信号时按空闲过期，默认 24h
 	ConversationMode string   `json:"conversation_mode"`
 	SortTools        bool     `json:"sort_tools"`
 	// PinThinking 仅固定无原生参数 schema 的旧模型预算，避免预算标签改写首条消息。
@@ -111,6 +111,8 @@ type Config struct {
 	// （刷新失败 / 403 / 网络）时只冷却、不停号。
 	BreakerWindow Duration `json:"breaker_window"`
 	LogLevel      string   `json:"log_level"`
+	// DebugRequestsDir 非空时保存完整上游请求和前缀诊断，包含对话与图片；默认关闭。
+	DebugRequestsDir string `json:"debug_requests_dir,omitzero"`
 }
 
 // Default 是默认配置。
@@ -129,7 +131,7 @@ func Default() Config {
 		CreditUSD:         0.02,
 		PriceSync:         Duration(24 * time.Hour),
 		PricesFile:        "prices.json",
-		SessionTTL:        Duration(45 * time.Minute),
+		SessionTTL:        Duration(24 * time.Hour),
 		ConversationMode:  ConversationSession,
 		SortTools:         true,
 		PinThinking:       true,

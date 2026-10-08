@@ -144,10 +144,15 @@ func Analyze(req *anthropic.Request, seed string, extra int, mode string) *Promp
 	}
 	p.sysEnd = len(p.cum)
 	for _, m := range req.Messages {
-		for i, b := range m.Content {
+		first := true
+		for _, b := range m.Content {
+			if b.Type == "thinking" || b.Type == "redacted_thinking" {
+				continue // 历史思考不发给上游，不加入前缀内容指纹
+			}
 			n := blockTokens(b)
-			if i == 0 {
+			if first {
 				n += messageOverhead
+				first = false
 			}
 			add(m.Role, stable(b), n, b.CacheControl)
 		}

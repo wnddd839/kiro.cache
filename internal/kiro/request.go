@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 	"unicode/utf8"
 
@@ -363,19 +364,7 @@ func buildEntries(req *anthropic.Request, model string) []entry {
 			u.Content = proceed
 		}
 	}
-	// 只重发最新一批图片，和 Kiro 自己的 agent 一致
-	latest := -1
-	for i := len(entries) - 1; i >= 0; i-- {
-		if u := entries[i].User; u != nil && len(u.Images) > 0 {
-			latest = i
-			break
-		}
-	}
-	for i := range entries {
-		if u := entries[i].User; u != nil && i != latest {
-			u.Images = nil
-		}
-	}
+	// 历史图片始终随原消息重发；新图不能删除已发送的历史字节。
 	return entries
 }
 
@@ -398,8 +387,9 @@ func buildTools(req *anthropic.Request, entries []entry) []tool {
 		if s := bytes.TrimSpace(schema); len(s) == 0 || string(s) == "null" {
 			schema = emptySchema
 		}
-		tools = append(tools, tool{Spec: &toolSpec{Name: name, Description: desc, InputSchema: inputSchema{JSON: schema}}})
+		tools = append(tools, tool{Spec: &toolSpec{Name: name, Description: desc, InputSchema: inputSchema{JSON: anthropic.CanonicalJSON(schema)}}})
 	}
+	var historical []tool
 	for _, e := range entries {
 		if e.Asst == nil {
 			continue
@@ -407,11 +397,12 @@ func buildTools(req *anthropic.Request, entries []entry) []tool {
 		for _, c := range e.Asst.ToolUses {
 			if !offered[c.Name] {
 				offered[c.Name] = true
-				tools = append(tools, tool{Spec: &toolSpec{Name: c.Name, Description: "Tool", InputSchema: inputSchema{JSON: emptySchema}}})
+				historical = append(historical, tool{Spec: &toolSpec{Name: c.Name, Description: "Tool", InputSchema: inputSchema{JSON: emptySchema}}})
 			}
 		}
 	}
-	return tools
+	slices.SortFunc(historical, func(a, b tool) int { return strings.Compare(a.Spec.Name, b.Spec.Name) })
+	return append(tools, historical...)
 }
 
 // ToolDescription 限制工具描述字节数，不切断 UTF-8 字符；空描述使用工具名。
@@ -482,7 +473,7 @@ func toolNames(req *anthropic.Request) map[string]string {
 
 func objectOrEmpty(raw json.RawMessage) json.RawMessage {
 	if s := bytes.TrimSpace(raw); len(s) > 0 && s[0] == '{' && json.Valid(s) {
-		return s
+		return anthropic.CanonicalJSON(s)
 	}
 	return json.RawMessage("{}")
 }

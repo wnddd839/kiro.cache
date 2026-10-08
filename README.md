@@ -135,7 +135,7 @@ export OPENAI_BASE_URL=http://127.0.0.1:8787/v1
 | `price_sync` | `24h` | 在线价格（仅 OpenRouter，过滤为 Kiro 模型）拉取间隔；`0` = 只用内置表 |
 | `prices_file` | `prices.json` | 在线价格缓存；空 = 只在内存 |
 | `admin_token` | 空 | `/admin` 的 `X-Admin-Token`；空 = 只允许本机访问 `/admin` |
-| `session_ttl` | `45m` | 会话 → 号、→ conversationId 的空闲过期 |
+| `session_ttl` | `24h` | 会话 → 号、→ conversationId 的空闲保留期；活跃会话续期，容量上限 4096 |
 | `conversation_mode` | `session` | `random` = 每次随机，用于 A/B 对照命中率 |
 | `sort_tools` | `true` | 工具声明按名排序（MCP 加载顺序不定） |
 | `pin_thinking` | `true` | 仅对没有原生参数 schema 的旧模型固定首次 thinking 预算；原生 effort 按每次请求生效 |
@@ -146,20 +146,21 @@ export OPENAI_BASE_URL=http://127.0.0.1:8787/v1
 | `limits_interval` | `0s` | 额度定时轮询间隔，默认关闭：只在某号报额度用尽时查它一个 |
 | `breaker_window` | `2m` | 全局熔断窗口：窗口内多数启用号同类失败判为全局故障，只冷却不停号 |
 | `log_level` | `info` | |
+| `debug_requests_dir` | 空 | 开启后保存完整上游请求与相邻前缀诊断，包含对话和图片；默认关闭，目录需手动清理 |
 
 ## cache 命中做了什么
 
 1. **会话键**：header（`X-Session-Id` 等）→ `metadata.user_id` 里的 session → system + 首条 user 指纹。
-2. **粘号**：同一会话始终回到同一号；只有该号冷却 / 停用 / 满并发才换。新会话挑并发最少、剩余额度最多、最久没用的号。
+2. **粘号**：同一会话回到同一号；账号忙时等待，超时返回重试提示，不借号。只有冷却 / 停用 / 失败等不可用时才换。会话默认空闲 24h 后过期，活跃使用续期。
 3. **稳定 conversationId**：按 会话 → 号 → conversationId 钉住；历史被回退 / 编辑 / 压缩时只轮换该号的。
-4. **前缀修复**：剥离 Claude Code 的 `x-anthropic-billing-header`（`cch` 每次变）、工具排序、可选 system 正则。支持原生思考参数的模型不再向 prompt 注入预算标签；旧模型保留标签与预算钉住。
+4. **前缀修复**：剥离 Claude Code 的 `x-anthropic-billing-header`（`cch` 每次变）、工具按名排序、schema / tool-use input 对象键规范化、可选 system 正则。历史图片全部保留；不转发的旧思考块不参与会话指纹。支持原生思考参数的模型不再向 prompt 注入预算标签；旧模型原子固定首次预算。
 5. **分号统计**：`/admin/stats` 与 `/admin/accounts` 给出 `cache_read / cache_write / input`，切 `conversation_mode` 做 A/B。
 
 ## 思考参数与工具描述
 
 首次生成请求先读取模型目录的 `additionalModelRequestFieldsSchema`，后续按目录缓存刷新。Claude 类模型声明了 `output_config.effort` 时使用原生强度与 schema 允许的 `thinking` 配置；声明 `reasoning.effort` 的模型使用该字段。客户端的 `budget_tokens` 会映射为模型接受的强度，未指定预算时采用 schema 默认值。没有 schema 的旧模型保留原有 thinking 标签路径。
 
-原生参数放在请求根部的 `additionalModelRequestFields`，改变强度不会改写 system / history。不过 Sonnet 4.6 的实测中，首次切换 effort 后 credits 仍回到冷请求水平；本地缓存按生效参数隔离，不假定不同强度可以共用上游缓存。见 [实测记录](notes/native-thinking.md)。
+原生参数放在请求根部的 `additionalModelRequestFields`，改变强度不会改写 system / history。不过 Sonnet 4.6 的实测中，首次切换 effort 后 credits 仍回到冷请求水平；本地缓存按生效参数隔离，不假定不同强度可以共用上游缓存。见 [原生参数实测](notes/native-thinking.md) 和 [Sonnet 5.5 前缀审查](notes/prefix-stability.md)。Sonnet 5.5 的同类测试切强度后仍为暖请求成本，模型之间的行为不同。
 
 工具描述限制为 **10240 UTF-8 字节**，截断保留完整字符；本地计量与上游请求共用截断后的描述。
 
@@ -191,7 +192,13 @@ Kiro 的流里一般**不报 token**，只报上下文占用百分比和 credits
 
 - 非流式：整条收完才回写。上游中途报错或断流时丢掉半截内容，记到号上并换号；没有可换的号就回错误状态码，绝不把半句话当 `end_turn`。
 - 流式：已开始向下游写 SSE 后不再换号。中途报错 / 断流发 `error` 事件（不发 `message_stop`），同时记到号上。
-- 钉的号只是并发打满：先排队等它（最多 3 秒），等不到再临时借用别的号，但会话仍钉在原号。
+- 钉的号只是并发打满：先排队等它（最多 3 秒），等不到返回 429 + `Retry-After`，不借号；客户端取消排队时停止请求。
+
+## 前缀逐字节诊断
+
+设置 `"debug_requests_dir": ".cache/upstream-requests"` 可保存每次真实上游请求与 `.meta.json` 比较结果。文件包含完整对话、工具、图片及 profileArn，不含 Authorization 请求头。调试后关闭开关并按需清理目录。
+
+比较把 `history + current` 展开为消息序列，单独核对工具、账号、会话和模型参数；完整请求 JSON 会因为 current 移到 history 而改变外层结构，不能直接作为文件前缀判断。`messages_extend` 表示消息字节延续，`first_different_byte` 指向首个变化字节。system、工具或旧消息真正变化时如实报告，不冻结客户端内容。详见 [前缀审查与 Sonnet 5.5 实测](notes/prefix-stability.md)。
 
 ## 探测 Kiro 的真实行为
 

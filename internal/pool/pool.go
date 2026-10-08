@@ -186,11 +186,12 @@ type Pool struct {
 	log    *slog.Logger
 	now    func() time.Time
 
-	mu    sync.Mutex
-	slots map[string]*slot
-	order []string // 文件顺序
-	pins  *sessionpin.Table
-	freed *sync.Cond // 有号释放并发名额时广播；L 是 &mu
+	mu      sync.Mutex
+	slots   map[string]*slot
+	order   []string // 文件顺序
+	pins    *sessionpin.Table
+	pending map[string]*sessionLease // 首次答复前的临时账号选择，不落盘、不提交正式钉号
+	freed   *sync.Cond               // 有号释放并发名额时广播；L 是 &mu
 	// pick 在同一档的 n 个候选里选一个（随机；测试可替换）
 	pick func(n int) int
 	// pinWait 是钉的号只是忙时排队的上限；负数不等
@@ -244,12 +245,13 @@ type file struct {
 // Open 读号池文件；文件不存在时从空池开始。
 func Open(path string, opts Options) (*Pool, error) {
 	p := &Pool{
-		path:   path,
-		client: cmp.Or(opts.Client, kiro.NewClient(nil)),
-		log:    cmp.Or(opts.Logger, slog.Default()),
-		now:    time.Now,
-		slots:  map[string]*slot{},
-		pins:   sessionpin.New(opts.PinTTL),
+		path:    path,
+		client:  cmp.Or(opts.Client, kiro.NewClient(nil)),
+		log:     cmp.Or(opts.Logger, slog.Default()),
+		now:     time.Now,
+		slots:   map[string]*slot{},
+		pins:    sessionpin.New(opts.PinTTL),
+		pending: map[string]*sessionLease{},
 	}
 	p.freed = sync.NewCond(&p.mu)
 	p.pick = func(n int) int { return mrand.IntN(n) }
@@ -411,15 +413,19 @@ func (p *Pool) Totals() Stats {
 	return t
 }
 
+type sessionLease struct {
+	account string
+	leases  int
+}
+
 // Lease 是一次选号的结果。用完必须 Release。
 type Lease struct {
-	ID     string
-	Pinned bool // 是否命中会话粘滞
-	// Overflow 表示会话钉的号只是并发打满、本次临时借用了别的号：调用方不应把会话改钉到这个号，
-	// 原号上的上游缓存还在。
-	Overflow bool
-	pool     *Pool
-	once     sync.Once
+	ID      string
+	Pinned  bool // 是否命中会话粘滞
+	pool    *Pool
+	once    sync.Once
+	key     string
+	session *sessionLease
 }
 
 // Release 归还并发名额。可重复调用。
@@ -428,6 +434,12 @@ func (l *Lease) Release() {
 		l.pool.mu.Lock()
 		if s := l.pool.slots[l.ID]; s != nil && s.inflight > 0 {
 			s.inflight--
+		}
+		if l.session != nil {
+			l.session.leases--
+			if l.session.leases == 0 && l.pool.pending[l.key] == l.session {
+				delete(l.pool.pending, l.key)
+			}
 		}
 		l.pool.freed.Broadcast()
 		l.pool.mu.Unlock()
@@ -438,7 +450,7 @@ func (l *Lease) Release() {
 const DefaultPinWait = 3 * time.Second
 
 // Acquire 为会话 key 选一个号，跳过 exclude。key 为空时不粘滞。
-// 钉的号只是并发打满时先短暂排队等它；等不到再借用别的号，并标记 Overflow（不改钉）。
+// 钉的号只是并发打满时先排队，超时返回可重试错误，保留原号缓存。
 func (p *Pool) Acquire(key string, exclude []string) (*Lease, error) {
 	return p.AcquireContext(context.Background(), key, exclude)
 }
@@ -448,24 +460,49 @@ func (p *Pool) AcquireContext(ctx context.Context, key string, exclude []string)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := p.now()
-	overflow := false
-	if id, ok := p.pins.Lookup(key); ok && !slices.Contains(exclude, id) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	id, pinned := p.pins.Lookup(key)
+	if !pinned && p.pending[key] != nil {
+		id = p.pending[key].account
+	}
+	if id != "" && !slices.Contains(exclude, id) {
 		if s := p.slots[id]; s != nil {
 			if p.busyLocked(s, now) {
 				p.waitFreeLocked(ctx, s)
 				now = p.now()
 			}
-			if p.usableLocked(s, now) {
-				return p.leaseLocked(s, now, true), nil
+			if err := ctx.Err(); err != nil {
+				return nil, err
 			}
-			// 仍只是忙：本次借用别的号，但会话继续钉在原号上
-			overflow = p.busyLocked(s, now)
+			if p.slots[id] != s {
+				l, err := p.pickLocked(now, exclude)
+				return p.trackLeaseLocked(key, l, err)
+			}
+			if p.usableLocked(s, now) {
+				return p.trackLeaseLocked(key, p.leaseLocked(s, now, pinned), nil)
+			}
+			if p.busyLocked(s, now) {
+				return nil, &UnavailableError{RetryAt: now.Add(time.Second), Reason: "session account busy; retry on the same account"}
+			}
 		}
 	}
 	l, err := p.pickLocked(now, exclude)
-	if l != nil {
-		l.Overflow = overflow
+	return p.trackLeaseLocked(key, l, err)
+}
+
+func (p *Pool) trackLeaseLocked(key string, l *Lease, err error) (*Lease, error) {
+	if l == nil || key == "" {
+		return l, err
 	}
+	s := p.pending[key]
+	if s == nil || s.account != l.ID {
+		s = &sessionLease{account: l.ID}
+		p.pending[key] = s
+	}
+	s.leases++
+	l.key, l.session = key, s
 	return l, err
 }
 
@@ -579,7 +616,12 @@ func (p *Pool) Pin(key, id string) { p.pins.Remember(key, id) }
 func (p *Pool) Pins() *sessionpin.Table { return p.pins }
 
 // Unpin 解除会话粘滞。
-func (p *Pool) Unpin(key string) { p.pins.Forget(key) }
+func (p *Pool) Unpin(key string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.pending, key)
+	p.pins.Forget(key)
+}
 
 // Success 记一次成功，清掉限流计数。
 func (p *Pool) Success(id string, u kiro.Usage, costUSD float64, estimated bool) {

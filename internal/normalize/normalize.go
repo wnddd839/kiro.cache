@@ -55,6 +55,19 @@ func Request(req *anthropic.Request, opts Options) {
 	if opts.SortTools {
 		slices.SortStableFunc(req.Tools, func(a, b anthropic.Tool) int { return cmp.Compare(a.Name, b.Name) })
 	}
+	for i := range req.Tools {
+		req.Tools[i].InputSchema = anthropic.CanonicalJSON(req.Tools[i].InputSchema)
+	}
+	for i := range req.Messages {
+		canonicalInputs(req.Messages[i].Content)
+	}
+}
+
+func canonicalInputs(content anthropic.Content) {
+	for i := range content {
+		content[i].Input = anthropic.CanonicalJSON(content[i].Input)
+		canonicalInputs(content[i].Content)
+	}
 }
 
 // sessionIDRe 从 Claude Code 的 metadata.user_id 里取 session：

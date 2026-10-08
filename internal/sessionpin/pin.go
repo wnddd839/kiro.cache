@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-const defaultTTL = 45 * time.Minute
+const defaultTTL = 24 * time.Hour
 const maxEntries = 4096
 
 // SessionLabel 用首条 user 消息做可读会话名。
@@ -145,7 +145,7 @@ func (t *Table) Remember(key, accountID string) {
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if len(t.m) >= maxEntries {
+	if _, exists := t.m[key]; !exists && len(t.m) >= maxEntries {
 		t.evictExpiredLocked(time.Now())
 		if len(t.m) >= maxEntries {
 			t.evictOldestLocked()
@@ -169,6 +169,8 @@ func (t *Table) Lookup(key string) (string, bool) {
 		delete(t.m, key)
 		return "", false
 	}
+	p.until = time.Now().Add(t.ttl)
+	t.m[key] = p
 	return p.accountID, true
 }
 

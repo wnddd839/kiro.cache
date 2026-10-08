@@ -57,6 +57,7 @@ type Server struct {
 	bgWG        sync.WaitGroup  // 需要在退出前收尾的后台任务（最后一次落盘）
 
 	reqlog  *requestLog
+	traceMu sync.Mutex // 请求调试快照与相邻比较串行写入
 	login   loginJob
 	started time.Time
 

@@ -41,9 +41,25 @@ func (t *ttlMap[V]) get(key string) (V, bool) {
 	return e.v, true
 }
 
+func (t *ttlMap[V]) getOrSet(key string, v V) V {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if e, ok := t.m[key]; ok && time.Now().Before(e.until) {
+		e.until = time.Now().Add(t.ttl)
+		t.m[key] = e
+		return e.v
+	}
+	t.setLocked(key, v)
+	return v
+}
+
 func (t *ttlMap[V]) set(key string, v V) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	t.setLocked(key, v)
+}
+
+func (t *ttlMap[V]) setLocked(key string, v V) {
 	now := time.Now()
 	if _, ok := t.m[key]; !ok && len(t.m) >= maxSessions {
 		var oldest string
@@ -109,6 +125,9 @@ func lineage(req *anthropic.Request) []uint64 {
 	out := make([]uint64, 0, len(req.Messages))
 	for _, m := range req.Messages {
 		m.Content = withoutCacheControl(m.Content)
+		if m.Role == "assistant" && len(m.Content) == 0 {
+			continue // 旧思考块不发往上游，不应因其变化轮换 conversationId
+		}
 		b, _ := json.Marshal(m)
 		sum := sha256.Sum256(b)
 		out = append(out, binary.LittleEndian.Uint64(sum[:8]))
@@ -117,13 +136,17 @@ func lineage(req *anthropic.Request) []uint64 {
 }
 
 func withoutCacheControl(c anthropic.Content) anthropic.Content {
-	out := make(anthropic.Content, len(c))
-	for i, b := range c {
+	out := make(anthropic.Content, 0, len(c))
+	for _, b := range c {
+		if b.Type == "thinking" || b.Type == "redacted_thinking" {
+			continue
+		}
 		b.CacheControl = nil
+		b.Input = anthropic.CanonicalJSON(b.Input)
 		if len(b.Content) > 0 {
 			b.Content = withoutCacheControl(b.Content)
 		}
-		out[i] = b
+		out = append(out, b)
 	}
 	return out
 }

@@ -23,5 +23,6 @@ kiro-go.json
 
 # 本地
 .cache/
+debug-requests/
 *.log
 .DS_Store

@@ -59,18 +59,17 @@ const thinkingTagTokens = 24
 
 // call 是一次下游请求在分发层里的状态。
 type call struct {
-	proto   proto
-	req     anthropic.Request
-	chat    openai.ChatOptions
-	resp    openai.ResponsesOptions
-	model   string // Kiro 模型 id
-	thread  string // 会话线程键：粘号、钉 conversationId、钉 thinking
-	budget  int
-	lineage []uint64
-	prompt  *meter.Prompt
-	schema  *kiro.ModelRequestSchema
-	// overflow 是本次尝试只是临时借用（钉的号并发打满）：答复后不改钉
-	overflow bool
+	proto    proto
+	req      anthropic.Request
+	chat     openai.ChatOptions
+	resp     openai.ResponsesOptions
+	model    string // Kiro 模型 id
+	thread   string // 会话线程键：粘号、钉 conversationId、钉 thinking
+	budget   int
+	lineage  []uint64
+	prompt   *meter.Prompt
+	schema   *kiro.ModelRequestSchema
+	traceKey string    // 客户端会话标识，调试时跨 system 变化比较
 	key      *keys.Key // nil 是匿名（未配 key 或命中 config.api_keys）
 	start    time.Time
 	entry    usage.Entry // 最终一次尝试的记账（含请求状态）
@@ -143,15 +142,19 @@ func (s *Server) prepare(r *http.Request, p proto, k *keys.Key) (*call, error) {
 		return nil, err
 	}
 	c.thread = threadKey(r, &c.req, k)
+	c.traceKey = sessionpin.Key(r.Header, cmp.Or(c.req.PromptCacheKey, r.Header.Get("X-Claude-Code-Session-Id"), normalize.MetadataSession(&c.req)), nil)
+	if c.traceKey == "" {
+		c.traceKey = c.thread
+	}
+	if k != nil {
+		c.traceKey = "key:" + k.ID + "|" + c.traceKey
+	}
 	c.lineage = lineage(&c.req)
 
 	c.budget = kiro.ThinkingBudget(&c.req, c.model)
 	if c.schema == nil && s.cfg.PinThinking && c.thread != "" {
 		// 同一线程的 thinking 以首次为准：它写在首条消息前面，一变整段前缀就变
-		if pinned, ok := s.think.get(c.thread); ok {
-			c.budget = pinned
-		}
-		s.think.set(c.thread, c.budget)
+		c.budget = s.think.getOrSet(c.thread, c.budget)
 	}
 
 	extra := 0
@@ -317,6 +320,10 @@ func (s *Server) dispatch(w http.ResponseWriter, r *http.Request, c *call) {
 	for range s.cfg.MaxAttempts {
 		lease, err := s.pool.AcquireContext(ctx, c.thread, tried)
 		if err != nil {
+			if ctx.Err() != nil {
+				c.entry.Status, c.entry.Error = statusClientClosed, "client went away"
+				return
+			}
 			if last != nil {
 				fail(last.Status, last.Message)
 				return
@@ -332,7 +339,6 @@ func (s *Server) dispatch(w http.ResponseWriter, r *http.Request, c *call) {
 			return
 		}
 		c.entry.Attempts++
-		c.overflow = lease.Overflow
 		c.entry.Account, c.entry.Pinned = lease.ID, lease.Pinned
 		out := s.attempt(ctx, w, lease, c)
 		lease.Release()
@@ -399,7 +405,13 @@ func (s *Server) attempt(ctx context.Context, w http.ResponseWriter, lease *pool
 		return terminal(kiro.Failure{Status: http.StatusBadRequest, Message: "build request: " + err.Error()})
 	}
 
-	res, err := s.pool.Client().Generate(ctx, cred, payload)
+	generate := func() (*http.Response, error) {
+		if err := s.traceRequest(c, id, payload); err != nil {
+			s.log.Warn("upstream request trace failed", "err", err)
+		}
+		return s.pool.Client().Generate(ctx, cred, payload)
+	}
+	res, err := generate()
 	refreshErr := false
 	if err == nil && res.StatusCode == http.StatusForbidden {
 		body, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
@@ -430,7 +442,7 @@ func (s *Server) attempt(ctx context.Context, w http.ResponseWriter, lease *pool
 				opts.ProfileArn = cred.ProfileArn
 				payload, _, _ = kiro.Build(&c.req, opts)
 			}
-			res, err = s.pool.Client().Generate(ctx, cred, payload)
+			res, err = generate()
 		}
 	}
 	if err != nil {
@@ -660,15 +672,12 @@ func (s *Server) writeTurn(w http.ResponseWriter, c *call, t *turn.Turn) {
 	}
 }
 
-// commit 在确定由该号答复后记住：会话钉到这个号，并记下该号上的消息指纹。
-// 临时借用的号（原号只是并发打满）只记指纹不改钉：会话下一轮回到原号，那里的上游缓存还在。
+// commit 在确定由该号答复后记住会话账号及消息指纹。
 func (s *Server) commit(c *call, id string) {
 	if c.thread == "" {
 		return
 	}
-	if !c.overflow {
-		s.pool.Pin(c.thread, id)
-	}
+	s.pool.Pin(c.thread, id)
 	s.lines.set(lineKey(c.thread, id), c.lineage)
 }
 
