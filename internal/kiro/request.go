@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 
 	"kiro-proxy/internal/anthropic"
 )
@@ -22,6 +23,8 @@ const (
 	noResult = "Tool use was interrupted and did not produce a result."
 	// resultLimit 是单个工具结果的上限，和 Kiro 自己的 agent 一致。
 	resultLimit = 250_000
+	// toolDescriptionLimit 是上游工具描述的 UTF-8 字节上限。
+	toolDescriptionLimit = 10240
 )
 
 var emptySchema = json.RawMessage(`{"type":"object","properties":{}}`)
@@ -112,17 +115,19 @@ type currentMessage struct {
 }
 
 type body struct {
-	State      conversationState `json:"conversationState"`
-	AgentMode  string            `json:"agentMode"`
-	ProfileArn string            `json:"profileArn,omitzero"`
+	State      conversationState   `json:"conversationState"`
+	AgentMode  string              `json:"agentMode"`
+	ProfileArn string              `json:"profileArn,omitzero"`
+	Fields     *ModelRequestFields `json:"additionalModelRequestFields,omitzero"`
 }
 
 // BuildOptions 是构造请求需要的上游侧参数。
 type BuildOptions struct {
 	Model          string
 	ProfileArn     string
-	ConversationID string // 稳定的上游会话 ID；空则每次随机
-	ThinkingBudget int    // >0 时在首条消息前加 thinking 标签
+	ConversationID string              // 稳定的上游会话 ID；空则每次随机
+	ThinkingBudget int                 // 旧模型 >0 时在首条消息前加 thinking 标签
+	RequestSchema  *ModelRequestSchema // 模型声明了原生参数时优先用它，预算标签不再注入
 	// AgentContinuation 是探测开关：发一个由 conversationId 用 sha256 派生的固定 agentContinuationId。
 	// 主流程不设置，效果未知。
 	AgentContinuation bool
@@ -145,9 +150,13 @@ func (c CachePoints) Any() bool { return c.FirstUser || c.Assistant || c.Tools }
 // 输出对同一输入是字节级稳定的：上游 cache 靠前缀不变。
 func Build(req *anthropic.Request, opts BuildOptions) (payload []byte, names map[string]string, err error) {
 	entries := buildEntries(req, opts.Model)
+	fields, err := ThinkingFields(req, opts.RequestSchema)
+	if err != nil {
+		return nil, nil, err
+	}
 
 	system := req.System.Text("\n")
-	if opts.ThinkingBudget > 0 {
+	if opts.ThinkingBudget > 0 && opts.RequestSchema == nil {
 		tag := fmt.Sprintf("<thinking_mode>enabled</thinking_mode><max_thinking_length>%d</max_thinking_length>", opts.ThinkingBudget)
 		system = tag + prefixNonEmpty("\n", system)
 	}
@@ -190,6 +199,7 @@ func Build(req *anthropic.Request, opts BuildOptions) (payload []byte, names map
 		},
 		AgentMode:  "vibe",
 		ProfileArn: opts.ProfileArn,
+		Fields:     fields,
 	}
 	if opts.AgentContinuation {
 		out.State.AgentContinuationID = ContinuationID(convID)
@@ -383,10 +393,7 @@ func buildTools(req *anthropic.Request, entries []entry) []tool {
 			continue
 		}
 		offered[name] = true
-		desc := t.Description
-		if desc == "" {
-			desc = t.Name
-		}
+		desc := ToolDescription(t.Description, t.Name)
 		schema := t.InputSchema
 		if s := bytes.TrimSpace(schema); len(s) == 0 || string(s) == "null" {
 			schema = emptySchema
@@ -405,6 +412,22 @@ func buildTools(req *anthropic.Request, entries []entry) []tool {
 		}
 	}
 	return tools
+}
+
+// ToolDescription 限制工具描述字节数，不切断 UTF-8 字符；空描述使用工具名。
+// 计量与请求构造共用这个规则，避免为已截掉的内容计费。
+func ToolDescription(description, name string) string {
+	if description == "" {
+		description = name
+	}
+	if len(description) <= toolDescriptionLimit {
+		return description
+	}
+	n := toolDescriptionLimit
+	for !utf8.RuneStart(description[n]) {
+		n--
+	}
+	return description[:n]
 }
 
 var toolIDRe = regexp.MustCompile(`^[a-zA-Z0-9_.:-]{1,64}$`)

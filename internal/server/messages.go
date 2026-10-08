@@ -68,6 +68,7 @@ type call struct {
 	budget  int
 	lineage []uint64
 	prompt  *meter.Prompt
+	schema  *kiro.ModelRequestSchema
 	// overflow 是本次尝试只是临时借用（钉的号并发打满）：答复后不改钉
 	overflow bool
 	key      *keys.Key // nil 是匿名（未配 key 或命中 config.api_keys）
@@ -130,12 +131,22 @@ func (s *Server) prepare(r *http.Request, p proto, k *keys.Key) (*call, error) {
 		return nil, err
 	}
 	normalize.Request(&c.req, s.norm)
+	for i := range c.req.Tools {
+		t := &c.req.Tools[i]
+		t.Description = kiro.ToolDescription(t.Description, t.Name)
+	}
+	s.loadCatalog(r.Context())
 	c.model = kiroModel(c.req.Model, s.cfg.ModelAliases, s.models.known)
+	c.schema = s.models.model(c.model).RequestSchema
+	fields, err := kiro.ThinkingFields(&c.req, c.schema)
+	if err != nil {
+		return nil, err
+	}
 	c.thread = threadKey(r, &c.req, k)
 	c.lineage = lineage(&c.req)
 
 	c.budget = kiro.ThinkingBudget(&c.req, c.model)
-	if s.cfg.PinThinking && c.thread != "" {
+	if c.schema == nil && s.cfg.PinThinking && c.thread != "" {
 		// 同一线程的 thinking 以首次为准：它写在首条消息前面，一变整段前缀就变
 		if pinned, ok := s.think.get(c.thread); ok {
 			c.budget = pinned
@@ -144,12 +155,18 @@ func (s *Server) prepare(r *http.Request, p proto, k *keys.Key) (*call, error) {
 	}
 
 	extra := 0
-	if c.budget > 0 {
-		extra = thinkingTagTokens
+	// 原生字段不改 prompt，但实测切 effort 仍会变冷，缓存按生效参数隔离。
+	native, _ := json.Marshal(fields)
+	seed := c.model + "|native|" + string(native)
+	if c.schema == nil {
+		seed = c.model + "|" + strconv.Itoa(c.budget)
+		if c.budget > 0 {
+			extra = thinkingTagTokens
+		}
 	}
-	// 前缀按整理后的请求算：这就是发给上游的内容。模型与 thinking 设置不同即不同缓存。
+	// 前缀指纹包含模型原生参数；旧模型另外计入 prompt 标签的开销。
 	// 上游声明不支持 prompt caching 的模型不模拟命中。
-	c.prompt = meter.Analyze(&c.req, c.model+"|"+strconv.Itoa(c.budget), extra, s.models.cacheMode(c.model, s.cacheMode(p)))
+	c.prompt = meter.Analyze(&c.req, seed, extra, s.models.cacheMode(c.model, s.cacheMode(p)))
 	if s.cfg.CacheTTL == config.CacheTTL5m {
 		c.prompt.CapTTL(5 * time.Minute)
 	}
@@ -376,7 +393,7 @@ func (s *Server) attempt(ctx context.Context, w http.ResponseWriter, lease *pool
 	}
 	rec.Conv = shortKey(convID)
 	points, _ := s.cfg.KiroCachePoints() // 已在加载配置时校验
-	opts := kiro.BuildOptions{Model: c.model, ProfileArn: cred.ProfileArn, ConversationID: convID, ThinkingBudget: c.budget, CachePoints: points}
+	opts := kiro.BuildOptions{Model: c.model, ProfileArn: cred.ProfileArn, ConversationID: convID, ThinkingBudget: c.budget, RequestSchema: c.schema, CachePoints: points}
 	payload, names, err := kiro.Build(&c.req, opts)
 	if err != nil {
 		return terminal(kiro.Failure{Status: http.StatusBadRequest, Message: "build request: " + err.Error()})
@@ -683,6 +700,10 @@ func (s *Server) countTokens(w http.ResponseWriter, r *http.Request, _ *keys.Key
 		return
 	}
 	normalize.Request(&req, s.norm)
+	for i := range req.Tools {
+		t := &req.Tools[i]
+		t.Description = kiro.ToolDescription(t.Description, t.Name)
+	}
 	writeJSON(w, http.StatusOK, map[string]int{"input_tokens": meter.Analyze(&req, "", 0, meter.ModeOff).Tokens})
 }
 

@@ -398,7 +398,9 @@ type Model struct {
 	Description string  `json:"description,omitzero"`
 	// PromptCaching 是上游声明的缓存规则（断点数 / 最小段长）。
 	PromptCaching *PromptCaching `json:"prompt_caching,omitzero"`
-	Default       bool           `json:"default,omitzero"`
+	// RequestSchema 是上游声明的模型原生参数，nil 表示未声明。
+	RequestSchema *ModelRequestSchema `json:"additional_model_request_fields_schema,omitzero"`
+	Default       bool                `json:"default,omitzero"`
 }
 
 // PromptCaching 是 List-Available-Models 里的 promptCaching。
@@ -412,10 +414,11 @@ type PromptCaching struct {
 func (c *Client) ListModels(ctx context.Context, cred Cred) ([]Model, error) {
 	var out struct {
 		Models []struct {
-			ModelID     string `json:"modelId"`
-			ModelName   string `json:"modelName"`
-			Description string `json:"description"`
-			TokenLimits struct {
+			ModelID       string              `json:"modelId"`
+			ModelName     string              `json:"modelName"`
+			Description   string              `json:"description"`
+			RequestSchema *ModelRequestSchema `json:"additionalModelRequestFieldsSchema"`
+			TokenLimits   struct {
 				MaxInput  int `json:"maxInputTokens"`
 				MaxOutput int `json:"maxOutputTokens"`
 			} `json:"tokenLimits"`
@@ -446,7 +449,7 @@ func (c *Client) ListModels(ctx context.Context, cred Cred) ([]Model, error) {
 		}
 		model := Model{
 			ID: m.ModelID, Name: cmp.Or(m.ModelName, m.ModelID), Context: m.TokenLimits.MaxInput, Output: m.TokenLimits.MaxOutput,
-			Multiplier: m.RateMultiplier, RateUnit: m.RateUnit, Description: m.Description,
+			Multiplier: m.RateMultiplier, RateUnit: m.RateUnit, Description: m.Description, RequestSchema: m.RequestSchema,
 			Default: m.ModelID == out.DefaultModel.ModelID,
 		}
 		if pc := m.PromptCaching; pc != nil {

@@ -53,6 +53,12 @@ func (c *catalog) known(id string) bool {
 	return ok
 }
 
+func (c *catalog) model(id string) kiro.Model {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.models[id]
+}
+
 func (c *catalog) window(id string) int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -107,6 +113,22 @@ func (c *catalog) merge(models []kiro.Model) {
 		c.models[m.ID] = m
 	}
 	c.at = time.Now()
+}
+
+// loadCatalog 首次请求先读取模型参数，防止把支持原生字段的新模型按旧 prompt 标签处理。
+// 后续请求继续由 ensureCatalog 在后台刷新。
+func (s *Server) loadCatalog(ctx context.Context) {
+	if !s.models.updated().IsZero() {
+		return
+	}
+	s.catalogBusy.Lock()
+	defer s.catalogBusy.Unlock()
+	if !s.models.updated().IsZero() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	s.refreshCatalog(ctx)
 }
 
 // refreshCatalog 从每个启用号拉模型列表并合并。失败只记日志。

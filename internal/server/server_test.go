@@ -37,7 +37,8 @@ type fakeKiro struct {
 	refreshes   int
 	limitsFor   []string // Get-Usage-Limits 请求的 token
 	// hangups 是接下来要直接关连接、不回任何字节的请求数（模拟空闲连接被对端关掉）
-	hangups int
+	hangups    int
+	modelsJSON string // 非空时作为模型目录响应，用于原生参数端到端验证
 }
 
 type upstreamCall struct {
@@ -120,6 +121,10 @@ func (f *fakeKiro) handler(t *testing.T) http.Handler {
 		w.Write(frame("metadataEvent", `{"tokenUsage":{"uncachedInputTokens":10,"outputTokens":3,"cacheReadInputTokens":900,"cacheWriteInputTokens":5}}`))
 	})
 	mux.HandleFunc("GET /mgmt/{region}/List-Available-Models", func(w http.ResponseWriter, r *http.Request) {
+		if f.modelsJSON != "" {
+			io.WriteString(w, f.modelsJSON)
+			return
+		}
 		io.WriteString(w, `{"models":[{"modelId":"claude-sonnet-4.5","modelName":"Sonnet","tokenLimits":{"maxInputTokens":200000}}],"defaultModel":{"modelId":"claude-sonnet-4.5"}}`)
 	})
 	mux.HandleFunc("GET /mgmt/{region}/Get-Usage-Limits", func(w http.ResponseWriter, r *http.Request) {

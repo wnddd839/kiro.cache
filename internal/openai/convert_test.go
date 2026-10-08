@@ -208,8 +208,8 @@ func TestFromResponsesStringInput(t *testing.T) {
 	if got := mustJSON(t, r.Messages); got != `[{"role":"user","content":[{"type":"text","text":"hello"}]}]` {
 		t.Errorf("messages = %s", got)
 	}
-	if r.Thinking != nil {
-		t.Error("effort none should be off")
+	if r.Thinking == nil || r.Thinking.Type != "disabled" || r.OutputConfig == nil || r.OutputConfig.Effort != "none" {
+		t.Error("effort none must remain an explicit native disable")
 	}
 }
 

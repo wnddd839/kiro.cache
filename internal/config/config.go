@@ -96,7 +96,7 @@ type Config struct {
 	SessionTTL       Duration `json:"session_ttl"`
 	ConversationMode string   `json:"conversation_mode"`
 	SortTools        bool     `json:"sort_tools"`
-	// PinThinking 让一个会话的 thinking 预算以首次请求为准，中途开关不改首条消息前缀。
+	// PinThinking 仅固定无原生参数 schema 的旧模型预算，避免预算标签改写首条消息。
 	PinThinking bool `json:"pin_thinking"`
 	// SystemStrip 是从 system 里删掉的正则（如 cwd / 日期行）。只在确认它们打破 cache 时加。
 	SystemStrip []string `json:"system_strip,omitzero"`

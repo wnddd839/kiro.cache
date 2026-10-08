@@ -465,11 +465,14 @@ func toolChoice(raw json.RawMessage) json.RawMessage {
 	return b
 }
 
-// setEffort 打开 thinking 并记下 effort；minimal / none / 空 / 未知值都算关闭。
+// setEffort 保留模型原生强度；none 显式关闭，minimal / 空 / 未知值沿用旧处理。
 func setEffort(req *anthropic.Request, effort string) {
 	switch e := strings.ToLower(strings.TrimSpace(effort)); e {
 	case "low", "medium", "high", "xhigh", "max":
 		req.OutputConfig = &anthropic.OutputConfig{Effort: e}
 		req.Thinking = &anthropic.Thinking{Type: "enabled"}
+	case "none":
+		req.OutputConfig = &anthropic.OutputConfig{Effort: e}
+		req.Thinking = &anthropic.Thinking{Type: "disabled"}
 	}
 }
