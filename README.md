@@ -11,11 +11,13 @@
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-BSD--3--Clause-1C1C1C?style=flat-square" alt="License" /></a>
   <a href="https://go.dev/"><img src="https://img.shields.io/badge/Go-%E2%89%A51.26-1C1C1C?style=flat-square&logo=go&logoColor=white" alt="Go" /></a>
+  <a href="https://github.com/wnddd839/kiro.cache/releases/latest"><img src="https://img.shields.io/github/v/release/wnddd839/kiro.cache?style=flat-square&color=1C1C1C" alt="Release" /></a>
   <img src="https://img.shields.io/badge/Kiro-Local%20Tools-1C1C1C?style=flat-square" alt="Kiro" />
   <img src="https://img.shields.io/badge/Compatible-Anthropic%20%7C%20OpenAI-1C1C1C?style=flat-square" alt="Downstream" />
 </p>
 
 <p align="center">
+  <a href="#下载">下载</a> ·
   <a href="#快速开始">快速开始</a> ·
   <a href="#管理台">管理台</a> ·
   <a href="#接口">接口</a> ·
@@ -47,6 +49,24 @@
 - **缓存命中优化**：会话粘号 + 稳定 conversationId + 前缀修复（剥离每次都变的 `x-anthropic-billing-header`、工具排序、按模型能力使用原生思考参数）。
 - **账号管理**：浏览器 OAuth 登录（Google / GitHub / Builder ID / IAM IdC）、导入 Kiro IDE 凭证、手填 token。单飞 refresh、冷却、额度轮询。
 - **管理台**：概览、账号、用量账单、接入、请求、模型，纯静态页 + `/admin/*`。
+
+## 下载
+
+预编译单文件，无需运行时依赖：
+
+| 平台 | 文件 |
+|---|---|
+| Windows x64 | `kiro-proxy-windows-amd64.exe` |
+| Linux x64 | `kiro-proxy-linux-amd64` |
+| macOS Apple Silicon | `kiro-proxy-darwin-arm64` |
+
+从 [Releases](https://github.com/wnddd839/kiro.cache/releases/latest) 下载最新版（当前 **v0.2.0**），校验：
+
+```sh
+sha256sum -c SHA256SUMS.txt
+```
+
+更新说明见 [v0.2.0 发布说明](docs/RELEASE-v0.2.0.md)。
 
 ## 快速开始
 
