@@ -60,13 +60,13 @@
 | Linux x64 | `kiro-proxy-linux-amd64` |
 | macOS Apple Silicon | `kiro-proxy-darwin-arm64` |
 
-从 [Releases](https://github.com/wnddd839/kiro.cache/releases/latest) 下载最新版（当前 **v0.2.0**），校验：
+从 [Releases](https://github.com/wnddd839/kiro.cache/releases/latest) 下载最新版（当前 **v0.2.1**），校验：
 
 ```sh
 sha256sum -c SHA256SUMS.txt
 ```
 
-更新说明见 [v0.2.0 发布说明](docs/RELEASE-v0.2.0.md)。
+更新说明见 [v0.2.1 发布说明](docs/RELEASE-v0.2.1.md)。
 
 ## 快速开始
 
