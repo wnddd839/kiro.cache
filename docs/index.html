@@ -1,0 +1,901 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>kiro-proxy — 把 Kiro 账号池变成 /v1</title>
+  <meta name="description" content="kiro-proxy：本地 Kiro 反代 + 自有号池分发。对下游说 Anthropic Messages / OpenAI Chat Completions / OpenAI Responses，对上游说 Kiro。会话粘号、稳定 conversationId，把上游 prompt cache 命中率打上去。" />
+  <meta property="og:title" content="kiro-proxy" />
+  <meta property="og:description" content="把 Kiro 账号池变成任何 Anthropic / OpenAI 客户端都能直连的本地网关。" />
+  <meta property="og:type" content="website" />
+  <meta property="og:url" content="https://wnddd839.github.io/kiro-proxy/" />
+  <meta property="og:image" content="https://wnddd839.github.io/kiro-proxy/logo.svg" />
+  <meta name="twitter:card" content="summary" />
+  <link rel="canonical" href="https://wnddd839.github.io/kiro-proxy/" />
+  <link rel="icon" href="./logo.svg" type="image/svg+xml" />
+  <style>
+    :root {
+      /* Editorial 纯单色核心色彩字典 */
+      --bg: #F9F8F6;
+      --fg: #1C1C1C;
+      --fg-80: rgba(28, 28, 28, 0.80);
+      --fg-60: rgba(28, 28, 28, 0.60);
+      --fg-40: rgba(28, 28, 28, 0.40);
+      --fg-20: rgba(28, 28, 28, 0.20);
+      --fg-10: rgba(28, 28, 28, 0.10);
+      --invert-bg: #1C1C1C;
+      --invert-fg: #F9F8F6;
+      --display: Georgia, "Iowan Old Style", "Palatino Linotype", Palatino, "Songti SC", "Noto Serif SC", serif;
+      --sans: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      --max: 1360px;
+    }
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      border-radius: 0 !important;
+      box-shadow: none !important;
+    }
+    html { scroll-behavior: smooth; }
+    body {
+      font-family: var(--sans);
+      background: var(--bg);
+      color: var(--fg);
+      line-height: 1.625;
+      font-size: 14.5px;
+      letter-spacing: -0.01em;
+      -webkit-font-smoothing: antialiased;
+    }
+    a { color: inherit; text-decoration: none; }
+    .wrap {
+      width: min(100% - 4rem, var(--max));
+      margin-inline: auto;
+    }
+
+    /* 刊头固定导航 (Fixed Navigation) */
+    .nav {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      z-index: 50;
+      padding: 20px 0;
+      background: rgba(249, 248, 246, 0.92);
+      backdrop-filter: blur(8px);
+      border-bottom: 1px solid var(--fg-10);
+    }
+    .nav-inner {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 2rem;
+    }
+    .brand {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.85rem;
+    }
+    .brand img {
+      width: 22px;
+      height: 22px;
+      display: block;
+    }
+    .brand-title {
+      font-family: var(--display);
+      font-size: 18px;
+      font-weight: 400;
+      letter-spacing: 0.25em;
+      text-transform: uppercase;
+      color: var(--fg);
+    }
+    .nav-links {
+      display: flex;
+      gap: 2.2rem;
+      align-items: center;
+      font-size: 11.5px;
+      letter-spacing: 0.2em;
+      text-transform: uppercase;
+      color: var(--fg-60);
+    }
+    .nav-links a:hover { color: var(--fg); }
+    .nav-cta {
+      border: 1px solid var(--fg) !important;
+      padding: 7px 18px;
+      color: var(--fg) !important;
+      font-weight: 500;
+      transition: background 200ms ease, color 200ms ease;
+    }
+    .nav-cta:hover {
+      background: var(--invert-bg);
+      color: var(--invert-fg) !important;
+    }
+
+    /* 链接下划线展开动效 (scaleX from right-to-left on hover) */
+    .link-hover {
+      position: relative;
+      display: inline-block;
+    }
+    .link-hover::after {
+      content: "";
+      position: absolute;
+      left: 0;
+      bottom: -2px;
+      width: 100%;
+      height: 1px;
+      background: currentColor;
+      transform: scaleX(0);
+      transform-origin: 100% 50%;
+      transition: transform 300ms ease;
+    }
+    .link-hover:hover::after {
+      transform: scaleX(1);
+      transform-origin: 0% 50%;
+    }
+
+    /* Hero Section (大号衬线标题与 12 栏排版) */
+    .hero {
+      padding-top: clamp(140px, 20vh, 200px);
+      padding-bottom: clamp(64px, 10vh, 120px);
+      border-bottom: 1px solid var(--fg-10);
+    }
+    .hero-kicker {
+      font-size: 11px;
+      letter-spacing: 0.25em;
+      text-transform: uppercase;
+      color: var(--fg-40);
+      margin-bottom: 2rem;
+    }
+    .hero-title {
+      font-family: var(--display);
+      font-weight: 400;
+      font-size: clamp(3.4rem, 8.5vw, 8.5rem);
+      line-height: 0.92;
+      letter-spacing: -0.04em;
+      margin-bottom: 3.5rem;
+      color: var(--fg);
+    }
+    .hero-title em {
+      font-style: italic;
+      font-family: var(--display);
+      font-weight: 400;
+    }
+
+    .hero-grid-12 {
+      display: grid;
+      grid-template-columns: repeat(12, 1fr);
+      gap: 2.5rem;
+      align-items: baseline;
+    }
+    .hero-col-lead {
+      grid-column: span 6;
+      color: var(--fg-60);
+      font-size: clamp(16px, 1.8vw, 20px);
+      line-height: 1.65;
+      font-style: italic;
+    }
+    .hero-col-actions {
+      grid-column: span 6;
+      display: flex;
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 1.5rem;
+    }
+    @media (max-width: 900px) {
+      .hero-col-lead, .hero-col-actions { grid-column: span 12; }
+      .nav-links a:not(.nav-cta) { display: none; }
+    }
+
+    .hero-btn-row {
+      display: flex;
+      gap: 1.5rem;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 14px 32px;
+      font-size: 12px;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+      font-weight: 500;
+      cursor: pointer;
+      border: 1px solid transparent;
+      transition: background 200ms ease, color 200ms ease, border-color 200ms ease;
+    }
+    .btn-solid {
+      background: var(--invert-bg);
+      color: var(--invert-fg);
+      border-color: var(--invert-bg);
+    }
+    .btn-solid:hover {
+      background: var(--fg);
+      border-color: var(--fg);
+      opacity: 0.9;
+    }
+    .btn-line {
+      background: transparent;
+      border-color: var(--fg-20);
+      color: var(--fg);
+    }
+    .btn-line:hover {
+      border-color: var(--fg);
+      background: rgba(28, 28, 28, 0.02);
+    }
+
+    /* 通用 12 栏 Section 布局 */
+    section {
+      padding: clamp(80px, 14vh, 150px) 0;
+      border-bottom: 1px solid var(--fg-10);
+    }
+    .grid-12 {
+      display: grid;
+      grid-template-columns: repeat(12, 1fr);
+      gap: 3.5rem;
+      align-items: start;
+    }
+    .col-sidebar {
+      grid-column: span 4;
+      position: sticky;
+      top: 100px;
+    }
+    .col-content {
+      grid-column: span 8;
+    }
+    @media (max-width: 960px) {
+      .col-sidebar, .col-content { grid-column: span 12; position: static; }
+    }
+
+    .section-num {
+      font-family: var(--display);
+      font-size: 16px;
+      font-style: italic;
+      color: var(--fg-40);
+      margin-bottom: 0.75rem;
+    }
+    .section-label {
+      font-size: 11px;
+      letter-spacing: 0.22em;
+      text-transform: uppercase;
+      color: var(--fg-40);
+      margin-bottom: 1rem;
+    }
+    .section-title {
+      font-family: var(--display);
+      font-weight: 400;
+      font-size: clamp(28px, 3.8vw, 48px);
+      letter-spacing: -0.025em;
+      line-height: 1.1;
+      margin-bottom: 1.25rem;
+      color: var(--fg);
+    }
+    .section-desc {
+      color: var(--fg-60);
+      font-size: 14.5px;
+      line-height: 1.7;
+      max-width: 32rem;
+    }
+
+    /* 编目式特性列表 (group-hover:italic 动效) */
+    .article-item {
+      border-top: 1px solid var(--fg-10);
+      padding: 28px 0;
+      transition: border-color 250ms ease;
+    }
+    .article-item:first-child { border-top: 1px solid var(--fg-20); }
+    .article-item:hover {
+      border-top-color: var(--fg-60);
+    }
+    .article-topline {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 1rem;
+      margin-bottom: 0.75rem;
+    }
+    .article-item h3 {
+      font-family: var(--display);
+      font-weight: 400;
+      font-size: 24px;
+      letter-spacing: -0.015em;
+      color: var(--fg);
+      transition: font-style 400ms ease;
+    }
+    .article-item:hover h3 {
+      font-style: italic;
+    }
+    .article-index {
+      font-family: var(--mono);
+      font-size: 12px;
+      color: var(--fg-40);
+    }
+    .article-item p {
+      color: var(--fg-60);
+      font-size: 14px;
+      line-height: 1.7;
+      max-width: 42rem;
+    }
+    .article-item code {
+      font-family: var(--mono);
+      font-size: 12.5px;
+      color: var(--fg);
+      background: rgba(28, 28, 28, 0.04);
+      padding: 1px 4px;
+    }
+
+    /* 客户端接入选项卡与终端窗口 */
+    .integration-box {
+      border: 1px solid var(--fg-10);
+      padding: 0;
+      background: transparent;
+    }
+    .integration-nav {
+      display: flex;
+      border-bottom: 1px solid var(--fg-10);
+      background: rgba(28, 28, 28, 0.02);
+      overflow-x: auto;
+    }
+    .tab-trigger {
+      padding: 14px 22px;
+      background: transparent;
+      border: none;
+      border-right: 1px solid var(--fg-10);
+      font-family: var(--sans);
+      font-size: 12px;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--fg-60);
+      cursor: pointer;
+      transition: all 200ms ease;
+    }
+    .tab-trigger:hover { color: var(--fg); }
+    .tab-trigger.active {
+      background: var(--bg);
+      color: var(--fg);
+      font-weight: 600;
+      box-shadow: inset 0 -2px 0 var(--fg);
+    }
+    .integration-panel {
+      padding: 28px;
+    }
+    .integration-code-pre {
+      font-family: var(--mono);
+      font-size: 12.5px;
+      line-height: 1.75;
+      color: var(--fg-80);
+      white-space: pre;
+      overflow-x: auto;
+    }
+    .integration-code-pre .dim { color: var(--fg-40); }
+    .integration-code-pre .hot {
+      font-weight: 600;
+      color: var(--fg);
+      text-decoration: underline;
+      text-underline-offset: 2px;
+    }
+    .integration-actions {
+      display: flex;
+      justify-content: flex-end;
+      margin-top: 18px;
+      padding-top: 14px;
+      border-top: 1px dashed var(--fg-10);
+    }
+
+    /* 细线下载表格 */
+    .dl-table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+    .dl-table th, .dl-table td {
+      text-align: left;
+      padding: 20px 0;
+      border-bottom: 1px solid var(--fg-10);
+    }
+    .dl-table th {
+      font-size: 11px;
+      letter-spacing: 0.2em;
+      text-transform: uppercase;
+      color: var(--fg-40);
+      font-weight: 400;
+    }
+    .dl-table tr:hover td {
+      border-bottom-color: var(--fg-40);
+    }
+    .dl-table a {
+      font-family: var(--mono);
+      font-size: 13.5px;
+      color: var(--fg);
+      text-decoration: underline;
+      text-underline-offset: 3px;
+    }
+    .dl-table a:hover {
+      color: var(--fg-60);
+    }
+    .dl-meta {
+      margin-top: 2rem;
+      font-size: 13px;
+      color: var(--fg-60);
+    }
+    .dl-meta a {
+      text-decoration: underline;
+      text-underline-offset: 3px;
+    }
+
+    /* 三步跑起来 (01, 02, 03) */
+    .steps-deck {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 2.5rem;
+    }
+    @media (max-width: 800px) { .steps-deck { grid-template-columns: 1fr; } }
+    .step-card {
+      border-top: 1px solid var(--fg-20);
+      padding-top: 1.5rem;
+    }
+    .step-num {
+      font-family: var(--display);
+      font-size: 24px;
+      font-style: italic;
+      color: var(--fg-40);
+      margin-bottom: 0.75rem;
+    }
+    .step-card h4 {
+      font-family: var(--display);
+      font-size: 19px;
+      font-weight: 400;
+      margin-bottom: 0.5rem;
+      color: var(--fg);
+    }
+    .step-card p {
+      color: var(--fg-60);
+      font-size: 13.5px;
+      line-height: 1.65;
+    }
+
+    /* 合规声明三卡片 */
+    .notice-deck {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 2.5rem;
+    }
+    @media (max-width: 800px) { .notice-deck { grid-template-columns: 1fr; } }
+    .notice-block {
+      border-top: 1px solid var(--fg-10);
+      padding-top: 1.5rem;
+    }
+    .notice-block h3 {
+      font-family: var(--display);
+      font-size: 18px;
+      font-weight: 400;
+      margin-bottom: 0.75rem;
+      color: var(--fg);
+    }
+    .notice-block p {
+      color: var(--fg-60);
+      font-size: 13.5px;
+      line-height: 1.7;
+    }
+    .notice-block code {
+      font-family: var(--mono);
+      font-size: 12.5px;
+      color: var(--fg);
+    }
+
+    /* 结语 CTA */
+    .cta-stage {
+      padding: clamp(80px, 16vh, 180px) 0;
+      border-bottom: none;
+    }
+    .cta-title {
+      font-family: var(--display);
+      font-weight: 400;
+      font-size: clamp(2.8rem, 5.5vw, 6rem);
+      line-height: 1.05;
+      letter-spacing: -0.03em;
+      max-width: 16ch;
+      margin-bottom: 2rem;
+      color: var(--fg);
+    }
+    .cta-desc {
+      color: var(--fg-60);
+      font-size: 16px;
+      max-width: 38rem;
+      margin-bottom: 2.5rem;
+      line-height: 1.65;
+    }
+
+    /* 页脚 (Inverted Monochrome Footer) */
+    footer {
+      background: var(--invert-bg);
+      color: var(--invert-fg);
+      padding: 72px 0;
+      font-size: 11.5px;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+    }
+    .footer-flex {
+      display: flex;
+      justify-content: space-between;
+      gap: 2.5rem;
+      flex-wrap: wrap;
+      align-items: center;
+      color: rgba(249, 248, 246, 0.55);
+    }
+    .footer-flex a {
+      color: var(--invert-fg);
+      text-decoration: underline;
+      text-underline-offset: 3px;
+    }
+
+    /* Toast 提示 */
+    .toast-box {
+      position: fixed;
+      bottom: 28px;
+      right: 28px;
+      z-index: 100;
+      padding: 12px 24px;
+      background: var(--invert-bg);
+      color: var(--invert-fg);
+      font-size: 12px;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      border: 1px solid var(--invert-bg);
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 300ms ease;
+    }
+    .toast-box.show { opacity: 1; }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        animation: none !important;
+        transition: none !important;
+      }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- 刊头导航 -->
+  <header class="nav" id="nav">
+    <div class="wrap nav-inner">
+      <a class="brand" href="./">
+        <img src="./logo.svg" alt="kiro-proxy" width="22" height="22" />
+        <span class="brand-title">kiro-proxy</span>
+      </a>
+      <nav class="nav-links" aria-label="导航">
+        <a class="link-hover" href="#capabilities">能力</a>
+        <a class="link-hover" href="#integration">接入</a>
+        <a class="link-hover" href="#releases">下载</a>
+        <a class="link-hover" href="#started">指南</a>
+        <a class="link-hover" href="#compliance">合规</a>
+        <a class="nav-cta" href="https://github.com/wnddd839/kiro-proxy" target="_blank" rel="noopener">GitHub 仓库</a>
+      </nav>
+    </div>
+  </header>
+
+  <main>
+    <!-- Hero Section -->
+    <section class="hero" aria-label="kiro-proxy Hero">
+      <div class="wrap">
+        <div class="hero-kicker">Local Kiro Pool Gateway · Issue No. 01</div>
+        <h1 class="hero-title">
+          把 Kiro 账号池<br />
+          变成 <em>/v1.</em>
+        </h1>
+        <div class="hero-grid-12">
+          <div class="hero-col-lead">
+            对下游说 Anthropic Messages / OpenAI Chat Completions / OpenAI Responses，对上游说 Kiro。
+            会话粘号、稳定 conversationId，把同一段对话认回来，让 Kiro 自己的 prompt cache 打中。
+          </div>
+          <div class="hero-col-actions">
+            <div class="hero-btn-row">
+              <a class="btn btn-solid" href="#releases">下载最新发布</a>
+              <a class="btn btn-line" href="http://127.0.0.1:8787/ui" target="_blank">本地管理台</a>
+            </div>
+            <div style="font-size:12px;color:var(--fg-40);letter-spacing:0.08em;text-transform:uppercase">
+              默认端点 127.0.0.1:8787 · 三种协议 · 号池分发
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 01 / 核心能力 -->
+    <section id="capabilities">
+      <div class="wrap grid-12">
+        <div class="col-sidebar">
+          <div class="section-num">01 /</div>
+          <div class="section-label">Capabilities</div>
+          <h2 class="section-title">只做一件事：<br />把上游 cache 打中.</h2>
+          <p class="section-desc">
+            不是补齐缓存层，也不是账号轮询池。这个项目只做一件事：把多个 Kiro 账号变成合规的下游端点，并让请求前缀字节稳定。
+          </p>
+        </div>
+
+        <div class="col-content">
+          <article class="article-item">
+            <div class="article-topline">
+              <h3>三种下游协议</h3>
+              <span class="article-index">PROT-01</span>
+            </div>
+            <p>
+              同时说 <code>/v1/messages</code>（Anthropic）、<code>/v1/chat/completions</code> 与 <code>/v1/responses</code>（OpenAI）。
+              流式 / 非流式、工具调用、reasoning 全支持；路径前缀容错，客户端 base URL 带不带 <code>/v1</code> 都能用。
+            </p>
+          </article>
+
+          <article class="article-item">
+            <div class="article-topline">
+              <h3>把 prompt cache 命中率打上去</h3>
+              <span class="article-index">CACH-02</span>
+            </div>
+            <p>
+              会话粘号 + 稳定 <code>conversationId</code> + 前缀修复：剥离 Claude Code 每次都变的 <code>x-anthropic-billing-header</code>、
+              工具声明排序、thinking 预算钉住。同一会话始终回到同一号，只有该号冷却 / 停用 / 满并发才换。
+            </p>
+          </article>
+
+          <article class="article-item">
+            <div class="article-topline">
+              <h3>号池与失败自愈</h3>
+              <span class="article-index">POOL-03</span>
+            </div>
+            <p>
+              浏览器 OAuth（Google / GitHub / Builder ID / IdC）、导入 Kiro IDE 凭证、手填 token / API key。
+              单飞 refresh、冷却、额度轮询；窗口内多数号同类失败判为全局故障，只冷却不停号，任一请求成功即解除。
+            </p>
+          </article>
+
+          <article class="article-item">
+            <div class="article-topline">
+              <h3>用量与两本账</h3>
+              <span class="article-index">CRED-04</span>
+            </div>
+            <p>
+              按 Anthropic 官方规则在本地模拟 cache read / write，按 Kiro credits 折算上游成本；
+              对下游收费（Claude 官方价）与上游成本分开记，管理台按 key / 号 / 模型 / 天显示毛利率与亏损。
+            </p>
+          </article>
+
+          <article class="article-item">
+            <div class="article-topline">
+              <h3>一键生成 API Key</h3>
+              <span class="article-index">KEYS-05</span>
+            </div>
+            <p>
+              管理台「接入」页直接生成下游 key，明文只显示一次，服务端只存 sha256。
+              客户端带 <code>x-api-key</code> 或 <code>Authorization: Bearer</code> 即可。
+            </p>
+          </article>
+
+          <article class="article-item">
+            <div class="article-topline">
+              <h3>上游行为可探测</h3>
+              <span class="article-index">PROB-06</span>
+            </div>
+            <p>
+              内置 <code>probe</code> 子命令直打上游，实测 token 上报口径、缓存存活时间、显式 cachePoint 是否生效、
+              credits 折算系数；<code>analyze</code> 给出可直接贴进配置的结论。
+            </p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <!-- 02 / 客户端快速接入 -->
+    <section id="integration">
+      <div class="wrap grid-12">
+        <div class="col-sidebar">
+          <div class="section-num">02 /</div>
+          <div class="section-label">Client Integration</div>
+          <h2 class="section-title">换个 Base URL<br />就能接.</h2>
+          <p class="section-desc">
+            下游工具链只认 Base URL 与 API Key。网关在本地完成协议翻译，凭证不出本机。
+          </p>
+        </div>
+
+        <div class="col-content">
+          <div class="integration-box">
+            <nav class="integration-nav">
+              <button type="button" class="tab-trigger active" onclick="switchClientTab('claude', this)">Claude Code</button>
+              <button type="button" class="tab-trigger" onclick="switchClientTab('openai', this)">OpenAI SDK</button>
+              <button type="button" class="tab-trigger" onclick="switchClientTab('codex', this)">Codex CLI</button>
+              <button type="button" class="tab-trigger" onclick="switchClientTab('cursor', this)">Cursor</button>
+              <button type="button" class="tab-trigger" onclick="switchClientTab('curl', this)">cURL 终端</button>
+            </nav>
+
+            <div class="integration-panel">
+              <pre class="integration-code-pre" id="integrationCodeBlock"></pre>
+              <div class="integration-actions">
+                <button type="button" class="btn btn-line" style="padding:8px 18px;font-size:11px" onclick="copyIntegrationCode()">
+                  复制代码片段
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 03 / 预编译二进制下载 -->
+    <section id="releases">
+      <div class="wrap grid-12">
+        <div class="col-sidebar">
+          <div class="section-num">03 /</div>
+          <div class="section-label">Distribution</div>
+          <h2 class="section-title">单文件即用，<br />无需安装.</h2>
+          <p class="section-desc">
+            下载对应平台可执行文件，直接运行。没有运行时依赖，账号与账本都落在本机。
+          </p>
+        </div>
+
+        <div class="col-content">
+          <table class="dl-table">
+            <thead>
+              <tr>
+                <th>平台架构 / Platform</th>
+                <th>发布二进制 / Binary Asset</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Windows 64 位 (x64)</td>
+                <td>
+                  <a href="https://github.com/wnddd839/kiro-proxy/releases/latest/download/kiro-proxy-windows-amd64.exe">kiro-proxy-windows-amd64.exe</a>
+                </td>
+              </tr>
+              <tr>
+                <td>Linux 64 位 (amd64)</td>
+                <td>
+                  <a href="https://github.com/wnddd839/kiro-proxy/releases/latest/download/kiro-proxy-linux-amd64">kiro-proxy-linux-amd64</a>
+                </td>
+              </tr>
+              <tr>
+                <td>macOS Apple 芯片 (Apple Silicon arm64)</td>
+                <td>
+                  <a href="https://github.com/wnddd839/kiro-proxy/releases/latest/download/kiro-proxy-darwin-arm64">kiro-proxy-darwin-arm64</a>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+
+          <div class="dl-meta">
+            完整校验哈希表：<a href="https://github.com/wnddd839/kiro-proxy/releases/latest/download/SHA256SUMS.txt">SHA256SUMS.txt</a>
+            · 也可自行构建：<a href="https://github.com/wnddd839/kiro-proxy#readme">make build</a>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 04 / 三步快速跑起来 -->
+    <section id="started">
+      <div class="wrap">
+        <div style="margin-bottom:3.5rem">
+          <div class="section-num">04 /</div>
+          <div class="section-label">Getting Started</div>
+          <h2 class="section-title">三步跑起来.</h2>
+        </div>
+
+        <div class="steps-deck">
+          <div class="step-card">
+            <div class="step-num">01 /</div>
+            <h4>登录并加入号池</h4>
+            <p>运行 <code>kiro-proxy login</code> 走浏览器 OAuth（Google / GitHub / Builder ID / IdC），或用 <code>import-ide</code> 导入 Kiro IDE 当前登录。可重复加多号。</p>
+          </div>
+          <div class="step-card">
+            <div class="step-num">02 /</div>
+            <h4>启动并生成 API Key</h4>
+            <p>直接运行 <code>kiro-proxy</code>，默认监听 <code>127.0.0.1:8787</code>。打开管理台 <code>http://127.0.0.1:8787/ui</code>，在「接入」页一键生成 API Key。</p>
+          </div>
+          <div class="step-card">
+            <div class="step-num">03 /</div>
+            <h4>配置下游工具</h4>
+            <p>Claude Code 填 <code>ANTHROPIC_BASE_URL=http://127.0.0.1:8787</code>；OpenAI SDK / Cursor 等填 <code>http://127.0.0.1:8787/v1</code>，带上 API Key。</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 05 / 责任边界与合规声明 -->
+    <section id="compliance">
+      <div class="wrap">
+        <div style="margin-bottom:3.5rem">
+          <div class="section-num">05 /</div>
+          <div class="section-label">Compliance &amp; Notice</div>
+          <h2 class="section-title">使用前请阅知这一节.</h2>
+        </div>
+
+        <div class="notice-deck">
+          <div class="notice-block">
+            <h3>它是什么</h3>
+            <p>一个自行托管、跑在你本机上的反代与号池工具。不提供模型中继，不代管任何账号——<strong>所有流量都从你自己的机器直发 Kiro</strong>，凭证与账本只落本机。</p>
+          </div>
+          <div class="notice-block">
+            <h3>你的责任</h3>
+            <p>请仅对拥有合法授权、且符合其服务条款的账号使用。是否允许此类协议调用由你与 Kiro / AWS 的协议决定——我们无法代为背书，也<strong>不对账号受限承担任何连带责任</strong>。</p>
+          </div>
+          <div class="notice-block">
+            <h3>我们不提供</h3>
+            <p>不提供账号或代充额度，不架设公共代理节点，不收集任何用户凭据。软件按开源「原样」免费提供，不保证上游协议持续兼容。</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 06 / 结语与引导 -->
+    <section class="cta-stage">
+      <div class="wrap">
+        <h2 class="cta-title">
+          把 Kiro 接到你的工具链.
+        </h2>
+        <p class="cta-desc">
+          管理台完成登录，客户端只认 Base URL 和 API Key。纯 Go 单文件，本地运行，零冗余开销。
+        </p>
+        <div class="hero-btn-row">
+          <a class="btn btn-solid" href="https://github.com/wnddd839/kiro-proxy" target="_blank" rel="noopener">访问 GitHub 仓库</a>
+          <a class="btn btn-line" href="https://github.com/wnddd839/kiro-proxy#readme" target="_blank" rel="noopener">查阅完整 README</a>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- 反相单色页脚 -->
+  <footer>
+    <div class="wrap footer-flex">
+      <div>kiro-proxy · BSD-3-Clause · 仅限个人授权与合规使用</div>
+      <div>与 Kiro、AWS 官方无关联、无隶属、无背书关系</div>
+      <div>
+        <a href="https://github.com/wnddd839/kiro-proxy" target="_blank" rel="noopener">Repository</a>
+        ·
+        <a href="https://github.com/wnddd839/kiro-proxy#readme" target="_blank" rel="noopener">Documentation</a>
+        ·
+        <a href="https://github.com/wnddd839/kiro-proxy/releases/latest" target="_blank" rel="noopener">Releases</a>
+      </div>
+    </div>
+  </footer>
+
+  <div class="toast-box" id="siteToast">已复制代码到剪贴板</div>
+
+  <script>
+    const codeMap = {
+      claude: `# Claude Code：导出环境变量后直接启动\nexport ANTHROPIC_BASE_URL="http://127.0.0.1:8787"\nexport ANTHROPIC_AUTH_TOKEN="你的网关 API Key"\nclaude`,
+      openai: `from openai import OpenAI\n\nclient = OpenAI(\n    base_url="http://127.0.0.1:8787/v1",\n    api_key="你的网关 API Key"\n)\n\nresp = client.chat.completions.create(\n    model="claude-sonnet-4.5",\n    messages=[{"role": "user", "content": "Ping!"}]\n)\nprint(resp.choices[0].message.content)`,
+      codex: `# Codex CLI：指向 Responses 端点\nexport OPENAI_BASE_URL="http://127.0.0.1:8787/v1"\nexport OPENAI_API_KEY="你的网关 API Key"\ncodex`,
+      cursor: `// Cursor → Settings → Models → OpenAI API Key\nBase URL: http://127.0.0.1:8787/v1\nAPI Key:  你的网关 API Key\nModel:    claude-sonnet-4.5 (或 auto)`,
+      curl: `curl http://127.0.0.1:8787/v1/messages \\\n  -H "content-type: application/json" \\\n  -H "anthropic-version: 2023-06-01" \\\n  -H "x-api-key: 你的网关 API Key" \\\n  -d '{\n    "model": "claude-sonnet-4.5",\n    "max_tokens": 256,\n    "messages": [{"role": "user", "content": "ping"}]\n  }'`
+    };
+
+    let activeClientKey = 'claude';
+
+    function switchClientTab(key, btn) {
+      activeClientKey = key;
+      document.querySelectorAll('.tab-trigger').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      document.getElementById('integrationCodeBlock').textContent = codeMap[key];
+    }
+
+    function showToast(msg) {
+      const el = document.getElementById('siteToast');
+      el.textContent = msg;
+      el.classList.add('show');
+      clearTimeout(showToast._timer);
+      showToast._timer = setTimeout(() => el.classList.remove('show'), 2000);
+    }
+
+    function copyIntegrationCode() {
+      const text = codeMap[activeClientKey];
+      navigator.clipboard.writeText(text).then(() => {
+        showToast('已复制代码片段到剪贴板');
+      }).catch(() => {
+        showToast('复制失败，请手动选取');
+      });
+    }
+
+    // 初始化渲染代码选项卡
+    document.getElementById('integrationCodeBlock').textContent = codeMap[activeClientKey];
+  </script>
+</body>
+</html>
