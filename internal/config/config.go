@@ -59,9 +59,9 @@ type Config struct {
 	// UsageRetention 是账本保留期。
 	UsageRetention Duration `json:"usage_retention"`
 
-	// CacheMode 是本地 prompt cache 计量方式：protocol（默认：Anthropic Messages 走 explicit、OpenAI 走 auto）|
-	// auto（镜像 Kiro 5 分钟滑动 TTL，忽略 cache_control）| explicit（只认 cache_control，与 Anthropic 规则一致）| off。
-	// 下游看到的 cache_read / cache_creation 是本地模拟的。上游 promptCaching.supported=false 的模型强制 off。
+	// CacheMode 是本地 prompt cache 计量方式：auto（默认：所有协议自动前缀缓存，5 分钟滑动 TTL）|
+	// protocol（Anthropic Messages 走 explicit、OpenAI 走 auto）| explicit（只认 cache_control，支持客户端 TTL）| off。
+	// 未收到上游输入侧 tokenUsage 时，缓存读写用量由本地模拟；promptCaching.supported=false 的模型强制 off。
 	CacheMode string `json:"cache_mode"`
 	// CachePoints 是实验开关（默认空 = 关）：在这些位置给 Kiro 发 cachePoint{type:"default"}。
 	// 取值 first-user | assistant | tools。有没有用先跑 `kiro-proxy probe cachepoint` 对比。
@@ -75,7 +75,8 @@ type Config struct {
 	// conservative（默认：各字段取最后一次上报的值，缺失不覆盖，输入扣 Kiro 隐藏 token）| raw（不扣隐藏）|
 	// sum（多条累加）| ignore（只用本地拆分）。等 probe usage 有结论再改。
 	ReportedUsage string `json:"reported_usage,omitzero"`
-	// CacheTTL 是对客户端 1h 声明的处理：client（默认，按声明计 1h，写入 2 倍价）| 5m（一律按 5m 计）。
+	// CacheTTL 是 explicit / protocol 模式下对客户端 1h 声明的处理；auto 固定按 5m 计。
+	// client（默认，按声明计 1h，写入 2 倍价）| 5m（一律按 5m 计）。
 	CacheTTL string `json:"cache_ttl"`
 	// CacheFile 保存本地 prompt cache 状态（前缀指纹 + 过期时间，不含内容），重启后仍能判定命中；空 = 只在内存。
 	CacheFile string `json:"cache_file"`
@@ -123,7 +124,7 @@ func Default() Config {
 		KeysFile:          "keys.json",
 		UsageFile:         "usage.jsonl",
 		UsageRetention:    Duration(90 * 24 * time.Hour),
-		CacheMode:         meter.ModeProtocol,
+		CacheMode:         meter.ModeAuto,
 		OpenAIHostedTools: "drop",
 		CacheTTL:          CacheTTLClient,
 		CacheFile:         "promptcache.json",

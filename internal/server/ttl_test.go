@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"kiro-proxy/internal/config"
+	"kiro-proxy/internal/meter"
 	"kiro-proxy/internal/usage"
 )
 
@@ -39,9 +41,68 @@ func decodeFull(t *testing.T, res *http.Response) fullUsage {
 	return m.Usage
 }
 
+// 默认自动缓存：网关转成 Anthropic 请求时即使不生成 cache_control，也返回缓存读写用量。
+func TestDefaultCacheWithoutControl(t *testing.T) {
+	for _, emptyMode := range []bool{false, true} {
+		for _, streaming := range []bool{false, true} {
+			t.Run(fmt.Sprintf("empty-mode=%v/stream=%v", emptyMode, streaming), func(t *testing.T) {
+				h := newHarness(t, 1, func(c *config.Config) {
+					if emptyMode {
+						c.CacheMode = ""
+					}
+				})
+				h.up.stream = kiroPlain
+				body := convo("fix the bug")
+				if streaming {
+					body = strings.Replace(body, `"messages"`, `"stream":true,"messages"`, 1)
+				}
+				read := func() fullUsage {
+					res := h.post(t, "/v1/messages", body, nil)
+					if !streaming {
+						return decodeFull(t, res)
+					}
+					if res.StatusCode != http.StatusOK {
+						t.Fatalf("status %d", res.StatusCode)
+					}
+					var u fullUsage
+					var sawUsage bool
+					sc := bufio.NewScanner(res.Body)
+					for sc.Scan() {
+						data, ok := strings.CutPrefix(sc.Text(), "data: ")
+						if !ok || !strings.Contains(data, `"message_delta"`) {
+							continue
+						}
+						var event struct{ Usage fullUsage }
+						if err := json.Unmarshal([]byte(data), &event); err != nil {
+							t.Fatal(err)
+						}
+						u, sawUsage = event.Usage, true
+					}
+					if err := sc.Err(); err != nil || !sawUsage {
+						t.Fatalf("stream usage missing: %v", err)
+					}
+					return u
+				}
+				u1 := read()
+				if u1.CacheRead != 0 || u1.CacheWrite == 0 || u1.CacheCreation.E5m != u1.CacheWrite || u1.CacheCreation.E1h != 0 {
+					t.Fatalf("cold usage = %+v", u1)
+				}
+				u2 := read()
+				if u2.CacheRead == 0 || u2.CacheWrite != 0 {
+					t.Fatalf("warm usage = %+v", u2)
+				}
+				v := waitRequests(t, h, usage.Query{}, 2)
+				if v.Totals.CacheRead != int64(u2.CacheRead) || v.Totals.CacheWrite != int64(u1.CacheWrite) {
+					t.Fatalf("journal differs from responses: %+v", v.Totals)
+				}
+			})
+		}
+	}
+}
+
 // 客户端声明 1h：响应里 5m / 1h 拆分与总量自洽；账本记 cache_write_1h，费用按 2 倍。
 func TestAnthropic1hBilled(t *testing.T) {
-	h := newHarness(t, 1, nil)
+	h := newHarness(t, 1, func(c *config.Config) { c.CacheMode = meter.ModeProtocol })
 	h.up.stream = kiroPlain
 	u := decodeFull(t, h.post(t, "/v1/messages", cached(convo("fix the bug"), "1h"), nil))
 	if u.CacheWrite == 0 || u.CacheCreation.E1h != u.CacheWrite || u.CacheCreation.E5m != 0 {
@@ -59,7 +120,10 @@ func TestAnthropic1hBilled(t *testing.T) {
 	}
 
 	// cache_ttl=5m：同样的请求全按 5m
-	h5 := newHarness(t, 1, func(c *config.Config) { c.CacheTTL = config.CacheTTL5m })
+	h5 := newHarness(t, 1, func(c *config.Config) {
+		c.CacheMode = meter.ModeProtocol
+		c.CacheTTL = config.CacheTTL5m
+	})
 	h5.up.stream = kiroPlain
 	u5 := decodeFull(t, h5.post(t, "/v1/messages", cached(convo("fix the bug"), "1h"), nil))
 	if u5.CacheCreation.E1h != 0 || u5.CacheCreation.E5m != u5.CacheWrite || u5.CacheWrite == 0 {
@@ -69,7 +133,7 @@ func TestAnthropic1hBilled(t *testing.T) {
 
 // Anthropic 协议认 cache_control：没有断点就没有缓存读写；OpenAI 协议走 auto。
 func TestCacheModeByProtocol(t *testing.T) {
-	h := newHarness(t, 1, nil)
+	h := newHarness(t, 1, func(c *config.Config) { c.CacheMode = meter.ModeProtocol })
 	h.up.stream = kiroPlain
 	u := decodeUsage(t, h.post(t, "/v1/messages", convo("hi"), nil))
 	if u.CacheWrite != 0 || u.CacheRead != 0 {
@@ -89,7 +153,7 @@ func TestCacheModeByProtocol(t *testing.T) {
 
 // #7：上游报了真实 cacheWrite 时，1h 按本地占比搬过去。
 func TestReportedCacheWriteKeeps1hShare(t *testing.T) {
-	h := newHarness(t, 1, nil)
+	h := newHarness(t, 1, func(c *config.Config) { c.CacheMode = meter.ModeExplicit })
 	h.up.stream = func(string) []byte {
 		b := frame("assistantResponseEvent", `{"content":"ok"}`)
 		return append(b, frame("metadataEvent", `{"tokenUsage":{"uncachedInputTokens":10,"outputTokens":2,"cacheWriteInputTokens":3000}}`)...)

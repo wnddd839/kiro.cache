@@ -267,16 +267,21 @@ func TestThreadIsolatedPerKey(t *testing.T) {
 	}
 }
 
-// 上游目录的 minimumTokensPerCacheCheckpoint 生效，不再固定 1024。
-func TestMinCacheFromCatalog(t *testing.T) {
+// 下游最小缓存长度按 Anthropic 表计量，不跟随上游目录的 minimumTokensPerCacheCheckpoint。
+func TestCacheMinimumUsesAnthropicTable(t *testing.T) {
 	h := newHarness(t, 1, nil)
 	h.up.stream = kiroPlain
 	h.s.models.merge([]kiro.Model{{ID: "claude-sonnet-4.5", Context: 200000,
 		PromptCaching: &kiro.PromptCaching{Supported: true, MinTokens: 1 << 20}}})
-	decodeUsage(t, h.post(t, "/v1/messages", convo("hi"), nil))
-	u := decodeUsage(t, h.post(t, "/v1/messages", convo("hi", "ok", "more"), nil))
+	short := strings.Replace(convo("hi"), bigSystem, "short system", 1)
+	u := decodeUsage(t, h.post(t, "/v1/messages", short, nil))
 	if u.CacheRead != 0 || u.CacheWrite != 0 {
-		t.Fatalf("prefix below upstream minimum must not cache: %+v", u)
+		t.Fatalf("prefix below Anthropic minimum must not cache: %+v", u)
+	}
+	cold := decodeUsage(t, h.post(t, "/v1/messages", convo("hi"), nil))
+	warm := decodeUsage(t, h.post(t, "/v1/messages", convo("hi"), nil))
+	if cold.CacheWrite == 0 || warm.CacheRead == 0 {
+		t.Fatalf("upstream minimum must not suppress local metering: cold=%+v warm=%+v", cold, warm)
 	}
 }
 

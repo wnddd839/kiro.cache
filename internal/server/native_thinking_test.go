@@ -124,7 +124,7 @@ func TestToolDescriptionLimitAndMetering(t *testing.T) {
 				counts = append(counts, count.Input)
 			}
 			e := waitRequests(t, h, usage.Query{}, 1).Entries[0]
-			if counts[0] != counts[1] || e.Input != counts[1] {
+			if counts[0] != counts[1] || e.Input+e.CacheRead+e.CacheWrite != counts[1] {
 				t.Fatalf("meter billed discarded description: counts=%v entry=%+v", counts, e)
 			}
 		})

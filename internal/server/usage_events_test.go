@@ -128,7 +128,7 @@ func TestFailedAttemptCacheBillingAcrossRequests(t *testing.T) {
 	for _, ttl := range []string{"5m", "1h"} {
 		for _, stage := range []string{"before usage", "credits before content", "input before content", "after content"} {
 			t.Run(ttl+"/"+stage, func(t *testing.T) {
-				h := newHarness(t, 2, nil)
+				h := newHarness(t, 2, func(c *config.Config) { c.CacheMode = meter.ModeExplicit })
 				var clock atomic.Int64
 				clock.Store(time.Now().Unix())
 				h.s.cache = meter.NewCache(func() time.Time { return time.Unix(clock.Load(), 0) })

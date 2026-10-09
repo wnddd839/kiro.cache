@@ -44,7 +44,7 @@
 ## 它做了什么
 
 - **三种下游协议**：Anthropic Messages、OpenAI Chat Completions、OpenAI Responses（含工具调用、reasoning、流式 / 非流式）。
-- **用量计量**：每次请求拆成 input / cache read / cache write（含 1h）/ output，按 Anthropic 官方规则本地模拟。
+- **用量计量**：每次请求拆成 input / cache read / cache write / output，默认自动模拟 5 分钟前缀缓存；可切换为按客户端断点与 TTL 计量（含 1h）。
 - **两本账**：对下游收费（Claude 官方价）与上游成本（credits 折算）分开记，管理台看毛利与亏损。
 - **缓存命中优化**：会话粘号 + 稳定 conversationId + 前缀修复（剥离每次都变的 `x-anthropic-billing-header`、工具排序、按模型能力使用原生思考参数）。
 - **账号管理**：浏览器 OAuth 登录（Google / GitHub / Builder ID / IAM IdC）、导入 Kiro IDE 凭证、手填 token。单飞 refresh、冷却、额度轮询。
@@ -104,6 +104,40 @@ export OPENAI_BASE_URL=http://127.0.0.1:8787/v1
 
 鉴权：管理台建了 key 或配置了 `api_keys` 后，带 `x-api-key` 或 `Authorization: Bearer`；两者都没配时不校验。管理台「接入」页可一键生成 API Key。
 
+## 服务器反向代理与出站代理
+
+若挂载在 `/kiro/` 下，给下游 API 单独设置 location，管理台的 Basic Auth 只放在 `/kiro/` location 内。Basic Auth 与客户端的 `Authorization: Bearer` 共用同一个头；下游 API 应交给 kiro-proxy 的 API Key 鉴权。示例（位于同一 nginx `server` 中）：
+
+```nginx
+location ^~ /kiro/v1/ {
+    auth_basic off;
+    proxy_pass http://127.0.0.1:8787/;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_read_timeout 600s;
+    proxy_send_timeout 600s;
+    proxy_buffering off;
+    proxy_cache off;
+}
+
+location /kiro/ {
+    auth_basic "kiro admin";
+    auth_basic_user_file /etc/nginx/kiro-admin.htpasswd;
+    proxy_pass http://127.0.0.1:8787/;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}
+```
+
+`proxy_pass` 的尾斜杠会将 `/kiro/v1/messages` 转为 `/messages`，服务端支持该路径。公网 API 必须先配置下游 key，管理 API 另设 `admin_token`。客户端 Anthropic Base URL 填 `https://你的域名/kiro`，OpenAI Base URL 填 `https://你的域名/kiro/v1`。当前管理台「接入」页按域名根路径生成地址，反代带前缀时需手动补 `/kiro`。
+
+出站 HTTP 客户端已继承 Go 的代理环境变量支持，可在 systemd drop-in 中仅为本服务设置 `HTTPS_PROXY`、`HTTP_PROXY` 和 `NO_PROXY=127.0.0.1,localhost,::1`；支持 `socks5://用户名:密码@代理地址:端口`，无需新增应用配置。含凭据的 drop-in 保留在服务器上，不入库。代理失效时请求会失败，不会自动回退直连；替换代理后执行 `systemctl daemon-reload` 并重启服务。
+
 ## 管理台
 
 浏览器打开 `http://127.0.0.1:8787/`（或 `/ui`）。六个章节：
@@ -148,8 +182,8 @@ export OPENAI_BASE_URL=http://127.0.0.1:8787/v1
 | `keys_file` | `keys.json` | 管理台生成的下游 key。只存 secret 的 sha256；明文只在新建 / 换 secret 时显示一次 |
 | `usage_file` | `usage.jsonl` | 用量账本；空字符串 = 只记内存 |
 | `usage_retention` | `2160h` | 账本保留期（90 天） |
-| `cache_mode` | `protocol` | 本地 cache 计量：`protocol`（Messages 走 `explicit`，Chat / Responses 走 `auto`）、`auto`、`explicit`、`off` |
-| `cache_ttl` | `client` | 客户端声明 `ttl:"1h"` 时：`client` = 按 1h 计；`5m` = 一律按 5m 计 |
+| `cache_mode` | `auto` | 本地 cache 计量：所有协议自动模拟 5m 前缀缓存，不要求 `cache_control`；`protocol` = Messages 走 `explicit`、Chat / Responses 走 `auto`；`explicit` = 只认客户端断点；`off` = 关闭模拟 |
+| `cache_ttl` | `client` | `explicit` / `protocol` 模式下，客户端声明 `ttl:"1h"` 时：`client` = 按 1h 计；`5m` = 一律按 5m 计。`auto` 固定按 5m 计 |
 | `cache_points` | 空 | 实验：给 Kiro 发显式 `cachePoint{type:"default"}` 的位置（`first-user` / `assistant` / `tools`）。探测无效果，保持关闭 |
 | `credit_rates` | 内置拟合值 | 按 token 估 credits 的系数，模型前缀 → `{"context","output","read_factor"}`（每百万 token 的 credits），只用于上游没来得及报 credits 的中断请求 |
 | `reported_usage` | `conservative` | `conservative` / `raw` 按字段保留最后上报值，缺失不覆盖、显式 0 覆盖；`sum` 累加，`ignore` 用本地计量 |
@@ -176,6 +210,8 @@ export OPENAI_BASE_URL=http://127.0.0.1:8787/v1
 
 ## cache 命中做了什么
 
+升级提示：配置省略 `cache_mode` 时，新默认值为 `auto`，会改变 Anthropic 请求的缓存拆分与对应费用；已有配置显式写了 `protocol`、`explicit` 或 `off` 的，继续按原配置运行。需要保留旧版按协议计量的行为，请设置 `"cache_mode": "protocol"`。
+
 1. **会话键**：header（`X-Session-Id` 等）→ `metadata.user_id` 里的 session → system + 首条 user 指纹。
 2. **粘号**：同一会话回到同一号；账号忙时等待，超时返回重试提示，不借号。只有冷却 / 停用 / 失败等不可用时才换。会话默认空闲 24h 后过期，活跃使用续期。
 3. **稳定 conversationId**：按 会话 → 号 → conversationId 钉住；历史被回退 / 编辑 / 压缩时只轮换该号的。
@@ -195,7 +231,7 @@ export OPENAI_BASE_URL=http://127.0.0.1:8787/v1
 Kiro 的流里一般**不报 token**，只报上下文占用百分比和 credits。所以：
 
 - **input / output**：总量以上游为准。Kiro 报的上下文占用（百分比 × 窗口）是该模型分词器下的真实 token，减去 Kiro 自带的 system（按模型实测，约 3.6k–4k）就是本轮请求加输出。本地估算只用来分配普通输入 / 缓存读 / 缓存写 / 输出的比例。
-- **cache_read / cache_creation**：Anthropic Messages 按官方规则在本地模拟：只认客户端 `cache_control`（含顶层自动缓存），每个断点往前回看 20 块，最多 4 个断点，最小可缓存长度按官方分模型表（512 / 1024 / 2048 / 4096），命中按条目 TTL 续期。OpenAI 协议没有 cache_control，走自动前缀缓存。
+- **cache_read / cache_creation**：默认 `cache_mode: "auto"`，三种协议都自动模拟 5 分钟滑动 TTL 的前缀缓存，忽略客户端 `cache_control`。这样 OpenAI → sub2api → Anthropic 的链路即使没有缓存断点，也能返回缓存读写估算。设为 `protocol` 时，Anthropic Messages 才按客户端 `cache_control`（含顶层自动缓存）计量：每个断点往前回看 20 块，最多 4 个断点，支持 1h TTL；OpenAI 仍走自动缓存。最小可缓存长度按官方分模型表（512 / 1024 / 2048 / 4096）。这些拆分是本地模拟，不证明上游实际命中；上游报告输入侧 `tokenUsage` 时，按 `reported_usage` 配置采用报告值。
 - **两本账**：对下游收费（`cost_usd`，Claude API 官方价）与上游成本（`upstream_usd` = credits × `credit_usd`），管理台按 key / 号 / 模型 / 天显示毛利率与亏损。
 - **中断与重试**：客户端中断按已消耗量入账（`aborted`）；上游没报 credits 则按 token 估（`credits_estimated`）。换号重试的失败尝试单独一行（`retried`），不向下游收费。
 - **下游 usage**：只报 token 与 Kiro credits，**不报美元**。流式 `message_start` 的 usage 是保守下界，最终值以 `message_delta` 为准。
@@ -238,7 +274,7 @@ kiro-proxy -config kiro-proxy.json probe analyze -out probe.jsonl
 
 用一个号直打上游（会花 credits），每次调用一行 JSONL，实验前后各拉一次额度核对。`analyze` 给出 TTL 命中表、cachePoint 对比、可直接贴进配置的 `credit_rates`。
 
-实测结论（2026-10，claude-sonnet-4.5）：缓存存活约 **5 分钟**（间隔 0 / 4min 命中，6min 起不命中），与 Anthropic 默认 5m TTL 一致；请求声明 `ttl: "1h"` 且配置 `cache_ttl: "client"` 时，只在本地按客户端声明计费，**上游不分 TTL**。
+实测结论（2026-10，claude-sonnet-4.5）：缓存存活约 **5 分钟**（间隔 0 / 4min 命中，6min 起不命中），与 Anthropic 默认 5m TTL 一致；请求声明 `ttl: "1h"` 且配置 `cache_mode: "explicit"`（或 Messages 使用 `protocol`）、`cache_ttl: "client"` 时，只在本地按客户端声明计费，**上游不分 TTL**。默认 `auto` 忽略该声明，按 5m 模拟。
 
 ## 开发
 

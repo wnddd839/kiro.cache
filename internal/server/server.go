@@ -92,7 +92,7 @@ func New(bg context.Context, cfg config.Config, p *pool.Pool, log *slog.Logger, 
 		}
 	}
 	if cfg.CacheMode == "" {
-		cfg.CacheMode = meter.ModeProtocol
+		cfg.CacheMode = meter.ModeAuto
 	}
 	ttl := time.Duration(cfg.SessionTTL)
 	cache := meter.NewCache(nil)
