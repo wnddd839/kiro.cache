@@ -19,6 +19,102 @@ import (
 	"kiro-proxy/internal/usage"
 )
 
+func TestFirstReportedStreamUsageDoesNotOverbill(t *testing.T) {
+	for _, mode := range []string{kiro.ReportedConservative, kiro.ReportedRaw, kiro.ReportedSum} {
+		for _, input := range []int{0, 10} {
+			t.Run(fmt.Sprintf("%s/input=%d", mode, input), func(t *testing.T) {
+				h := newHarness(t, 1, func(c *config.Config) { c.ReportedUsage = mode })
+				h.up.stream = func(string) []byte {
+					b := frame("assistantResponseEvent", `{"content":"ok"}`)
+					return append(b, frame("metadataEvent", fmt.Sprintf(`{"tokenUsage":{"uncachedInputTokens":%d,"cacheReadInputTokens":6000,"outputTokens":3}}`, input))...)
+				}
+				body := strings.Replace(convo("hi"), `"messages"`, `"stream":true,"messages"`, 1)
+				res := h.post(t, "/v1/messages", body, nil)
+				var start, end usageBody
+				sawStart, sawEnd := false, false
+				sc := bufio.NewScanner(res.Body)
+				for sc.Scan() {
+					data, ok := strings.CutPrefix(sc.Text(), "data: ")
+					if !ok {
+						continue
+					}
+					var ev struct {
+						Type    string
+						Message struct{ Usage usageBody }
+						Usage   usageBody
+					}
+					if err := json.Unmarshal([]byte(data), &ev); err != nil {
+						t.Fatal(err)
+					}
+					switch ev.Type {
+					case "message_start":
+						start, sawStart = ev.Message.Usage, true
+					case "message_delta":
+						end, sawEnd = ev.Usage, true
+					}
+				}
+				if err := sc.Err(); err != nil || !sawStart || !sawEnd {
+					t.Fatalf("stream usage missing: %v", err)
+				}
+				// sub2api only overwrites message_delta input when it is positive.
+				mergedInput := start.Input
+				if end.Input > 0 {
+					mergedInput = end.Input
+				}
+				if start.Input > end.Input || mergedInput != input {
+					t.Fatalf("stream overbilled: start=%+v end=%+v merged=%d want=%d", start, end, mergedInput, input)
+				}
+			})
+		}
+	}
+}
+
+func TestReportedOutputSurvivesContextCalibration(t *testing.T) {
+	h := newHarness(t, 1, nil)
+	body := convo("hi")
+	res := h.post(t, "/v1/messages/count_tokens", body, nil)
+	var count struct {
+		Input int `json:"input_tokens"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&count); err != nil {
+		t.Fatal(err)
+	}
+	hidden := kiro.HiddenTokens("claude-sonnet-4.5")
+	upstream := hidden + (count.Input-hidden)*4/5 + 11
+	h.up.stream = func(string) []byte {
+		b := frame("assistantResponseEvent", `{"content":"hello world"}`)
+		b = append(b, frame("metadataEvent", `{"tokenUsage":{"outputTokens":11}}`)...)
+		return append(b, frame("contextUsageEvent", fmt.Sprintf(`{"contextUsagePercentage":%v}`, float64(upstream)/2000))...)
+	}
+	u := decodeUsage(t, h.post(t, "/v1/messages", body, nil))
+	if u.Output != 11 || u.Input+u.CacheRead+u.CacheWrite+u.Output != upstream {
+		t.Fatalf("reported output rescaled: usage=%+v upstream=%d", u, upstream)
+	}
+}
+
+func TestIgnoredReportsStillCalibrateContext(t *testing.T) {
+	h := newHarness(t, 1, func(c *config.Config) { c.ReportedUsage = kiro.ReportedIgnore })
+	body := convo("hi")
+	res := h.post(t, "/v1/messages/count_tokens", body, nil)
+	var count struct {
+		Input int `json:"input_tokens"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&count); err != nil {
+		t.Fatal(err)
+	}
+	hidden := kiro.HiddenTokens("claude-sonnet-4.5")
+	upstream := hidden + (count.Input-hidden+meter.Count("hello world"))*4/5
+	h.up.stream = func(string) []byte {
+		b := frame("assistantResponseEvent", `{"content":"hello world"}`)
+		b = append(b, frame("metadataEvent", `{"tokenUsage":{"uncachedInputTokens":999999,"outputTokens":9999}}`)...)
+		return append(b, frame("contextUsageEvent", fmt.Sprintf(`{"contextUsagePercentage":%v}`, float64(upstream)/2000))...)
+	}
+	u := decodeUsage(t, h.post(t, "/v1/messages", body, nil))
+	if u.Input < hidden || u.Output == 9999 || u.Input+u.CacheRead+u.CacheWrite+u.Output != upstream {
+		t.Fatalf("ignore failed to calibrate local usage: usage=%+v upstream=%d", u, upstream)
+	}
+}
+
 func TestPartialUsageEventsBilling(t *testing.T) {
 	for _, tc := range []struct {
 		name   string

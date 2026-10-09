@@ -67,19 +67,6 @@ const toolCallTokens = 8
 // pumpOpts 是上游报了 tokenUsage 时的口径。
 type pumpOpts struct {
 	mode string // kiro.Reported*
-	// reportsSeen 表示上游曾报过 tokenUsage：那时最终输入与本地估算无关，开头的输入只能报 0
-	reportsSeen bool
-}
-
-// startUsage 是流式开头（message_start）报的 usage：每一项都不超过结尾的最终值。
-//   - cache_read / cache_creation 给 0（最终拆分要校准后才知道）；
-//   - input 给普通输入的下界：客户端部分的校准比例不低于 0.5，Kiro 基线固定（meter.Calibrate），
-//     再留 2 个 token 的舍入余量；上游报过 tokenUsage 时最终输入取上游值，与本地无关，给 0。
-func startUsage(in turn.Usage, reportsSeen bool) turn.Usage {
-	if reportsSeen {
-		return turn.Usage{}
-	}
-	return turn.Usage{Input: max(0, in.Input/2-2)}
 }
 
 // reportedUsage 合并上游已报的记账；未报的部分保留本地计量。
@@ -99,8 +86,8 @@ func reportedUsage(u turn.Usage, k kiro.Usage, po pumpOpts) turn.Usage {
 }
 
 func pump(ctx context.Context, dec *kiro.Decoder, first kiro.Event, sink turn.Sink, input turn.Usage, settle func(turn.Usage, kiro.Usage) turn.Usage, po pumpOpts) reply {
-	// 开头只报保守的下界，最终值以结尾为准。客户端若把 message_start 的 usage 也计入，不会比最终值多
-	sink.Begin(startUsage(input, po.reportsSeen))
+	// 上游可能在流尾首次报告输入为 0，开头不能提前报本地基线；最终累计值以 End 为准。
+	sink.Begin(turn.Usage{})
 
 	// 上游在长 thinking 时可能很久不出字，定时 ping 防止客户端 / 代理断开
 	events := make(chan kiro.Event)
@@ -270,7 +257,7 @@ func (a *anthropicStream) Ping() { a.send("ping", map[string]any{}) }
 
 func (a *anthropicStream) End(stop string, u turn.Usage) {
 	a.closeBlock()
-	// message_delta 的 usage 是累计值，客户端以它为准：输入侧此时已按上游上下文校正过，比 message_start 里的估算准
+	// message_delta 的 usage 是最终累计值：包含 Kiro 输入，开头为 0，不应与开头重复相加。
 	a.send("message_delta", map[string]any{
 		"delta": map[string]any{"stop_reason": stop, "stop_sequence": nil},
 		"usage": anthropicUsage(u),

@@ -97,7 +97,7 @@ func TestImage(t *testing.T) {
 func TestCalibrate(t *testing.T) {
 	u := turn.Usage{Input: 4100, KiroInput: 4000, CacheRead: 800, CacheWrite: 100, Output: 50, Reasoning: 20, Credits: 0.5}
 	// 上游内容 840 = 本地 1050 × 0.8
-	got := Calibrate(u, 4000+840, 4000)
+	got := Calibrate(u, 4000+840, 4000, false)
 	want := turn.Usage{Input: 4080, KiroInput: 4000, CacheRead: 640, CacheWrite: 80, Output: 40, Reasoning: 16, Credits: 0.5}
 	if got != want {
 		t.Fatalf("calibrated = %+v, want %+v", got, want)
@@ -106,17 +106,17 @@ func TestCalibrate(t *testing.T) {
 		t.Fatalf("total %d, want upstream 4840 including Kiro input", got.PromptTokens()+got.Output)
 	}
 	// 舍入差归到普通输入，总量始终等于上游
-	odd := Calibrate(turn.Usage{Input: 3, CacheRead: 3, CacheWrite: 3, Output: 3}, 13, 0)
+	odd := Calibrate(turn.Usage{Input: 3, CacheRead: 3, CacheWrite: 3, Output: 3}, 13, 0, false)
 	if odd.PromptTokens()+odd.Output != 13 || odd.Input < 0 {
 		t.Fatalf("rounding = %+v", odd)
 	}
 	// 比例离谱、上游不足基线、本地为空：不动
 	for _, tc := range []struct{ up, hidden int }{{4000 + 5000, 4000}, {4000 + 100, 4000}, {3000, 4000}} {
-		if got := Calibrate(u, tc.up, tc.hidden); got != u {
+		if got := Calibrate(u, tc.up, tc.hidden, false); got != u {
 			t.Errorf("Calibrate(%d,%d) = %+v, want unchanged", tc.up, tc.hidden, got)
 		}
 	}
-	if got := Calibrate(turn.Usage{}, 5000, 4000); got != (turn.Usage{}) {
+	if got := Calibrate(turn.Usage{}, 5000, 4000, false); got != (turn.Usage{}) {
 		t.Errorf("empty = %+v", got)
 	}
 }

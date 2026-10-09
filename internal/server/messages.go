@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -476,8 +477,7 @@ func (s *Server) attempt(ctx context.Context, w http.ResponseWriter, lease *pool
 	// 输入侧按本地 prompt cache 模拟拆分；缓存跟号走，与上游一致
 	split := s.cache.Peek(id, c.prompt)
 	input := turn.Usage{Input: split.Input + kiro.HiddenTokens(c.model), KiroInput: kiro.HiddenTokens(c.model), CacheRead: split.CacheRead, CacheWrite: split.CacheWrite, CacheWrite1h: split.CacheWrite1h}
-	po := pumpOpts{mode: s.cfg.ReportedUsageMode(),
-		reportsSeen: s.reportsSeen.Load() && s.cfg.ReportedUsageMode() != kiro.ReportedIgnore}
+	po := pumpOpts{mode: s.cfg.ReportedUsageMode()}
 	if err == nil && first.Kind == kiro.EvError {
 		// 首条内容前也可能已报 credits / tokenUsage，只按已报用量记成本。
 		k := dec.Partial()
@@ -503,9 +503,15 @@ func (s *Server) attempt(ctx context.Context, w http.ResponseWriter, lease *pool
 	settle := func(u turn.Usage, k kiro.Usage) turn.Usage {
 		s.watchHidden(c.model, u, k) // 用校准前的本地计量反推 Kiro 隐藏 token
 		s.noteReported(c, id, input, k)
-		if !k.Reported && k.Input > 0 {
-			// 只校准客户端内容的比例，再将 Kiro 自带输入按普通输入计费；1h 占比不变。
-			u = meter.Calibrate(u, k.Input, kiro.HiddenTokens(c.model))
+		if !k.Reported || po.mode == kiro.ReportedIgnore {
+			upstream := k.Input
+			if po.mode == kiro.ReportedIgnore {
+				upstream = int(math.Round(k.ContextPct / 100 * float64(s.models.window(c.model))))
+			}
+			if upstream > 0 {
+				// 只校准客户端内容的比例，再将 Kiro 自带输入按普通输入计费；1h 占比不变。
+				u = meter.Calibrate(u, upstream, kiro.HiddenTokens(c.model), k.OutputReported && po.mode != kiro.ReportedIgnore)
+			}
 		}
 		u.CostUSD = s.pricer.Cost(c.model, u)
 		// 先记账再写结尾：下一个请求的预算判断要看到这一笔

@@ -60,13 +60,13 @@
 | Linux x64 | `kiro-proxy-linux-amd64` |
 | macOS Apple Silicon | `kiro-proxy-darwin-arm64` |
 
-从 [Releases](https://github.com/wnddd839/kiro.cache/releases/latest) 下载最新版（当前 **v0.2.1**），校验：
+从 [Releases](https://github.com/wnddd839/kiro.cache/releases/latest) 下载最新版（当前 **v0.3.0**），校验：
 
 ```sh
 sha256sum -c SHA256SUMS.txt
 ```
 
-更新说明见 [v0.2.1 发布说明](docs/RELEASE-v0.2.1.md)。
+更新说明见 [v0.3.0 发布说明](docs/RELEASE-v0.3.0.md)。
 
 ## 快速开始
 
@@ -235,7 +235,7 @@ Kiro 的流里一般**不报 token**，只报上下文占用百分比和 credits
 - **cache_read / cache_creation**：默认 `cache_mode: "auto"`，三种协议都自动模拟 5 分钟滑动 TTL 的前缀缓存，忽略客户端 `cache_control`。这样 OpenAI → sub2api → Anthropic 的链路即使没有缓存断点，也能返回缓存读写估算。设为 `protocol` 时，Anthropic Messages 才按客户端 `cache_control`（含顶层自动缓存）计量：每个断点往前回看 20 块，最多 4 个断点，支持 1h TTL；OpenAI 仍走自动缓存。最小可缓存长度按官方分模型表（512 / 1024 / 2048 / 4096）。这些拆分是本地模拟，不证明上游实际命中；上游报告输入侧 `tokenUsage` 时，按 `reported_usage` 配置采用报告值。
 - **两本账**：对下游收费（`cost_usd`，Claude API 官方价）与上游成本（`upstream_usd` = credits × `credit_usd`），管理台按 key / 号 / 模型 / 天显示毛利率与亏损。
 - **中断与重试**：客户端中断按已消耗量入账（`aborted`）；上游没报 credits 则按 token 估（`credits_estimated`）。换号重试的失败尝试单独一行（`retried`），不向下游收费。
-- **下游 usage**：只报 token 与 Kiro credits，**不报美元**。流式 `message_start` 的 usage 是保守下界，可能为 0，最终值以 `message_delta` 为准。Kiro 基线计费调整只作用于升级后的请求，不重算历史账本；接入方应据此更新计费说明。
+- **下游 usage**：只报 token 与 Kiro credits，**不报美元**。流式 `message_start` 的 usage 全部报 0，最终累计值以 `message_delta` 为准；不能只取流式开头用量计费。Kiro 基线计费调整只作用于升级后的请求，不重算历史账本；接入方应据此更新计费说明。
 - key 预算按各自周期（day / week / month / total，本地时区）累计，超限返回 402 + `x-should-retry: false`。准入时为在途请求预留额度，并行不会一起超支。
 
 ## 失败处理

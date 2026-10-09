@@ -47,7 +47,6 @@ type Server struct {
 	holds        *holdTable // 在途请求为 key 预留的额度
 	hidden       *hiddenWatch
 	reportedSeen atomic.Int64 // 上游报了 tokenUsage 的回复数（采样用）
-	reportsSeen  atomic.Bool  // 上游是否报过 tokenUsage（影响流式开头的下界）
 
 	catalogBusy sync.Mutex
 	priceBusy   sync.Mutex

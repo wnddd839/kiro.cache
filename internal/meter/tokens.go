@@ -113,10 +113,16 @@ func Scale1h(local1h, localWrite, write int) int {
 // upstream 是上游这一轮的上下文占用（百分比×窗口：含本轮输出，含 Kiro 自带部分）。
 // u.Input 已包含 hidden，先剥离这份固定基线，仅对客户端内容同比例校准，再按普通输入加回。
 // 缓存读写不重复包含 hidden；最终输入三分加输出对齐上游总量。
+// 精确上报的输出不缩放，只有本地估算输出才参与同比例校准。
 // 比例离谱（窗口或基线不对）时不动，仍用包含基线的本地估算。
-func Calibrate(u turn.Usage, upstream, hidden int) turn.Usage {
+func Calibrate(u turn.Usage, upstream, hidden int, outputReported bool) turn.Usage {
 	content := upstream - hidden
-	local := u.PromptTokens() + u.Output - hidden
+	local := u.PromptTokens() - hidden
+	if outputReported {
+		content -= u.Output
+	} else {
+		local += u.Output
+	}
 	if content <= 0 || local <= 0 {
 		return u
 	}
@@ -126,9 +132,11 @@ func Calibrate(u turn.Usage, upstream, hidden int) turn.Usage {
 	}
 	scale := func(n int) int { return int(math.Round(float64(n) * k)) }
 	out := u
-	out.Output = scale(u.Output)
+	if !outputReported {
+		out.Output = scale(u.Output)
+	}
 	out.Reasoning = min(scale(u.Reasoning), out.Output)
-	prompt := content - out.Output
+	prompt := upstream - hidden - out.Output
 	out.CacheRead = min(scale(u.CacheRead), prompt)
 	out.CacheWrite = min(scale(u.CacheWrite), prompt-out.CacheRead)
 	out.CacheWrite1h = Scale1h(u.CacheWrite1h, u.CacheWrite, out.CacheWrite)
