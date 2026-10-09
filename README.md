@@ -186,7 +186,7 @@ location /kiro/ {
 | `cache_ttl` | `client` | `explicit` / `protocol` 模式下，客户端声明 `ttl:"1h"` 时：`client` = 按 1h 计；`5m` = 一律按 5m 计。`auto` 固定按 5m 计 |
 | `cache_points` | 空 | 实验：给 Kiro 发显式 `cachePoint{type:"default"}` 的位置（`first-user` / `assistant` / `tools`）。探测无效果，保持关闭 |
 | `credit_rates` | 内置拟合值 | 按 token 估 credits 的系数，模型前缀 → `{"context","output","read_factor"}`（每百万 token 的 credits），只用于上游没来得及报 credits 的中断请求 |
-| `reported_usage` | `conservative` | `conservative` / `raw` 按字段保留最后上报值，缺失不覆盖、显式 0 覆盖；`sum` 累加，`ignore` 用本地计量 |
+| `reported_usage` | `conservative` | `conservative` / `raw` 按字段保留最后上报值（包括 Kiro 自带输入），缺失不覆盖、显式 0 覆盖；`sum` 累加，`ignore` 用本地计量 |
 | `openai_hosted_tools` | `drop` | OpenAI 内置工具（web_search 等）：`drop` 跳过并打 debug 日志；`reject` 返回 400 |
 | `identity` | kiro-cli 2.28.0 | 对上游声明的客户端身份（CLI 版本 / api_version / desktop UA），对齐 kiro-cli 以获得稳定兼容性 |
 | `cost_basis` | `api` | 对下游收费口径：`api` = Claude API 官方价；`credits` = credits × `credit_usd` |
@@ -230,11 +230,12 @@ location /kiro/ {
 
 Kiro 的流里一般**不报 token**，只报上下文占用百分比和 credits。所以：
 
-- **input / output**：总量以上游为准。Kiro 报的上下文占用（百分比 × 窗口）是该模型分词器下的真实 token，减去 Kiro 自带的 system（按模型实测，约 3.6k–4k）就是本轮请求加输出。本地估算只用来分配普通输入 / 缓存读 / 缓存写 / 输出的比例。
+- **input / output**：Kiro 自带的 system / 对话模板输入也向下游计费，不再由网关承担。上游未报告输入侧 `tokenUsage` 时，这部分按现有分模型实测基线估算（Claude 默认 4052、DeepSeek 3699、其它已测模型约 3.6k–4k），作为普通输入计入 `input_tokens`，不重复算入客户端缓存。上下文百分比可用且校准比例合理时，只缩放客户端内容，再加回固定基线，使输入三项加输出对齐上游上下文总量；否则使用包含基线的本地估算。上游报告输入侧 `tokenUsage` 时，保留报告的普通输入 / 缓存读 / 缓存写拆分，不扣基线，也不额外叠加。
+- **输入字段语义**：Anthropic 的 `input_tokens` 仅指普通输入，全输入 = `input_tokens + cache_read_input_tokens + cache_creation_input_tokens`。缓存覆盖客户端全部输入时，客户端部分的普通输入可为 0；本地估算下仍单独计入 Kiro 固定基线。OpenAI 的 `prompt_tokens` / Responses 的 `input_tokens` 是含缓存和 Kiro 输入的总输入，不能再加缓存字段计费。`/v1/messages/count_tokens` 与预算预留同样包含 Kiro 基线。
 - **cache_read / cache_creation**：默认 `cache_mode: "auto"`，三种协议都自动模拟 5 分钟滑动 TTL 的前缀缓存，忽略客户端 `cache_control`。这样 OpenAI → sub2api → Anthropic 的链路即使没有缓存断点，也能返回缓存读写估算。设为 `protocol` 时，Anthropic Messages 才按客户端 `cache_control`（含顶层自动缓存）计量：每个断点往前回看 20 块，最多 4 个断点，支持 1h TTL；OpenAI 仍走自动缓存。最小可缓存长度按官方分模型表（512 / 1024 / 2048 / 4096）。这些拆分是本地模拟，不证明上游实际命中；上游报告输入侧 `tokenUsage` 时，按 `reported_usage` 配置采用报告值。
 - **两本账**：对下游收费（`cost_usd`，Claude API 官方价）与上游成本（`upstream_usd` = credits × `credit_usd`），管理台按 key / 号 / 模型 / 天显示毛利率与亏损。
 - **中断与重试**：客户端中断按已消耗量入账（`aborted`）；上游没报 credits 则按 token 估（`credits_estimated`）。换号重试的失败尝试单独一行（`retried`），不向下游收费。
-- **下游 usage**：只报 token 与 Kiro credits，**不报美元**。流式 `message_start` 的 usage 是保守下界，最终值以 `message_delta` 为准。
+- **下游 usage**：只报 token 与 Kiro credits，**不报美元**。流式 `message_start` 的 usage 是保守下界，可能为 0，最终值以 `message_delta` 为准。Kiro 基线计费调整只作用于升级后的请求，不重算历史账本；接入方应据此更新计费说明。
 - key 预算按各自周期（day / week / month / total，本地时区）累计，超限返回 402 + `x-should-retry: false`。准入时为在途请求预留额度，并行不会一起超支。
 
 ## 失败处理

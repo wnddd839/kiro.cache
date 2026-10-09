@@ -95,15 +95,15 @@ func TestImage(t *testing.T) {
 }
 
 func TestCalibrate(t *testing.T) {
-	u := turn.Usage{Input: 100, CacheRead: 800, CacheWrite: 100, Output: 50, Reasoning: 20, Credits: 0.5}
+	u := turn.Usage{Input: 4100, KiroInput: 4000, CacheRead: 800, CacheWrite: 100, Output: 50, Reasoning: 20, Credits: 0.5}
 	// 上游内容 840 = 本地 1050 × 0.8
 	got := Calibrate(u, 4000+840, 4000)
-	want := turn.Usage{Input: 80, CacheRead: 640, CacheWrite: 80, Output: 40, Reasoning: 16, Credits: 0.5}
+	want := turn.Usage{Input: 4080, KiroInput: 4000, CacheRead: 640, CacheWrite: 80, Output: 40, Reasoning: 16, Credits: 0.5}
 	if got != want {
 		t.Fatalf("calibrated = %+v, want %+v", got, want)
 	}
-	if got.PromptTokens()+got.Output != 840 {
-		t.Fatalf("total %d, want upstream content 840", got.PromptTokens()+got.Output)
+	if got.PromptTokens()+got.Output != 4840 {
+		t.Fatalf("total %d, want upstream 4840 including Kiro input", got.PromptTokens()+got.Output)
 	}
 	// 舍入差归到普通输入，总量始终等于上游
 	odd := Calibrate(turn.Usage{Input: 3, CacheRead: 3, CacheWrite: 3, Output: 3}, 13, 0)

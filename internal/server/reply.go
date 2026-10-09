@@ -66,15 +66,14 @@ const toolCallTokens = 8
 // 上游中途失败时调 sink.Fail 并把失败返回；下游走了则不再写 sink。
 // pumpOpts 是上游报了 tokenUsage 时的口径。
 type pumpOpts struct {
-	hidden int    // Kiro 自带的上下文 token
-	mode   string // kiro.Reported*
+	mode string // kiro.Reported*
 	// reportsSeen 表示上游曾报过 tokenUsage：那时最终输入与本地估算无关，开头的输入只能报 0
 	reportsSeen bool
 }
 
 // startUsage 是流式开头（message_start）报的 usage：每一项都不超过结尾的最终值。
 //   - cache_read / cache_creation 给 0（最终拆分要校准后才知道）；
-//   - input 给本地未缓存输入的下界：校准按上游上下文把各项同比例缩放，比例不低于 0.5（meter.Calibrate），
+//   - input 给普通输入的下界：客户端部分的校准比例不低于 0.5，Kiro 基线固定（meter.Calibrate），
 //     再留 2 个 token 的舍入余量；上游报过 tokenUsage 时最终输入取上游值，与本地无关，给 0。
 func startUsage(in turn.Usage, reportsSeen bool) turn.Usage {
 	if reportsSeen {
@@ -89,11 +88,8 @@ func reportedUsage(u turn.Usage, k kiro.Usage, po pumpOpts) turn.Usage {
 	if k.Reported && po.mode != kiro.ReportedIgnore {
 		// 上游不分 TTL：1h 按本地拆分的占比搬到上游的 cacheWrite 上。
 		u.CacheWrite1h = meter.Scale1h(u.CacheWrite1h, u.CacheWrite, k.CacheWrite)
-		in, read := k.Input, k.CacheRead
-		if po.mode != kiro.ReportedRaw {
-			in, read = stripHidden(in, read, po.hidden)
-		}
-		u.Input, u.CacheRead, u.CacheWrite = in, read, k.CacheWrite
+		u.Input, u.CacheRead, u.CacheWrite = k.Input, k.CacheRead, k.CacheWrite
+		u.KiroInput = 0
 	}
 	if k.OutputReported && po.mode != kiro.ReportedIgnore {
 		u.Output = max(k.Output, u.Reasoning)
@@ -188,16 +184,6 @@ func pump(ctx context.Context, dec *kiro.Decoder, first kiro.Event, sink turn.Si
 			return reply{usage: u, kiro: ev.Usage, ok: true}
 		}
 	}
-}
-
-// stripHidden 从上游报的输入里扣掉 Kiro 自带的隐藏 token：先扣 uncached，不够再扣 cacheRead，扣到 0 为止。
-// 上游的计数若含 Kiro 自己的 system，原样下发就是把它算到下游头上；确认不含后切 raw 口径。
-func stripHidden(uncached, read, hidden int) (int, int) {
-	d := min(uncached, hidden)
-	uncached -= d
-	hidden -= d
-	read -= min(read, hidden)
-	return uncached, read
 }
 
 // anthropicStream 是 Anthropic Messages SSE 的 Sink。

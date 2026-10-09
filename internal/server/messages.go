@@ -238,7 +238,7 @@ func (s *Server) estimate(c *call, period usage.Totals) keys.Spent {
 	if c.req.MaxTokens > 0 {
 		out = min(out, c.req.MaxTokens)
 	}
-	u := turn.Usage{Input: c.prompt.Tokens, Output: out}
+	u := turn.Usage{Input: c.prompt.Tokens + kiro.HiddenTokens(c.model), Output: out}
 	if period.Requests > 0 {
 		u.Credits = period.Credits / float64(period.Requests)
 	}
@@ -475,8 +475,8 @@ func (s *Server) attempt(ctx context.Context, w http.ResponseWriter, lease *pool
 
 	// 输入侧按本地 prompt cache 模拟拆分；缓存跟号走，与上游一致
 	split := s.cache.Peek(id, c.prompt)
-	input := turn.Usage{Input: split.Input, CacheRead: split.CacheRead, CacheWrite: split.CacheWrite, CacheWrite1h: split.CacheWrite1h}
-	po := pumpOpts{hidden: kiro.HiddenTokens(c.model), mode: s.cfg.ReportedUsageMode(),
+	input := turn.Usage{Input: split.Input + kiro.HiddenTokens(c.model), KiroInput: kiro.HiddenTokens(c.model), CacheRead: split.CacheRead, CacheWrite: split.CacheWrite, CacheWrite1h: split.CacheWrite1h}
+	po := pumpOpts{mode: s.cfg.ReportedUsageMode(),
 		reportsSeen: s.reportsSeen.Load() && s.cfg.ReportedUsageMode() != kiro.ReportedIgnore}
 	if err == nil && first.Kind == kiro.EvError {
 		// 首条内容前也可能已报 credits / tokenUsage，只按已报用量记成本。
@@ -504,7 +504,7 @@ func (s *Server) attempt(ctx context.Context, w http.ResponseWriter, lease *pool
 		s.watchHidden(c.model, u, k) // 用校准前的本地计量反推 Kiro 隐藏 token
 		s.noteReported(c, id, input, k)
 		if !k.Reported && k.Input > 0 {
-			// 上游的上下文占用是真实 token（与各家分词器逐 token 一致），用它校正本地估算；1h 占比不变
+			// 只校准客户端内容的比例，再将 Kiro 自带输入按普通输入计费；1h 占比不变。
 			u = meter.Calibrate(u, k.Input, kiro.HiddenTokens(c.model))
 		}
 		u.CostUSD = s.pricer.Cost(c.model, u)
@@ -614,7 +614,9 @@ func (s *Server) estimateCredits(model string, u turn.Usage) (turn.Usage, bool) 
 	if u.Credits != 0 || (u.PromptTokens() == 0 && u.Output == 0) {
 		return u, false
 	}
-	u.Credits = meter.EstimateCredits(meter.CreditRateOf(model, s.cfg.CreditRates), u, kiro.HiddenTokens(model))
+	content := u
+	content.Input -= u.KiroInput
+	u.Credits = meter.EstimateCredits(meter.CreditRateOf(model, s.cfg.CreditRates), content, u.KiroInput)
 	return u, u.Credits > 0
 }
 
@@ -713,7 +715,8 @@ func (s *Server) countTokens(w http.ResponseWriter, r *http.Request, _ *keys.Key
 		t := &req.Tools[i]
 		t.Description = kiro.ToolDescription(t.Description, t.Name)
 	}
-	writeJSON(w, http.StatusOK, map[string]int{"input_tokens": meter.Analyze(&req, "", 0, meter.ModeOff).Tokens})
+	model := kiroModel(req.Model, s.cfg.ModelAliases, s.models.known)
+	writeJSON(w, http.StatusOK, map[string]int{"input_tokens": meter.Analyze(&req, "", 0, meter.ModeOff).Tokens + kiro.HiddenTokens(model)})
 }
 
 // listModels 同时是 Anthropic 与 OpenAI 的模型列表形状。key 限定了模型时只列允许的。

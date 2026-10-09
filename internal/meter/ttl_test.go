@@ -194,7 +194,7 @@ func TestScale1h(t *testing.T) {
 			t.Errorf("Scale1h(%d,%d,%d) = %d, want %d", tc.h, tc.w, tc.to, got, tc.want)
 		}
 	}
-	u := Calibrate(turn.Usage{CacheWrite: 1000, CacheWrite1h: 500, Output: 100}, 4000+880, 4000)
+	u := Calibrate(turn.Usage{Input: 4000, CacheWrite: 1000, CacheWrite1h: 500, Output: 100}, 4000+880, 4000)
 	if u.CacheWrite1h*2 != u.CacheWrite {
 		t.Fatalf("calibrated 1h share changed: %+v", u)
 	}

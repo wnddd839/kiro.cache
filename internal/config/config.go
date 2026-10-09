@@ -72,7 +72,7 @@ type Config struct {
 	// Identity 是对上游报的客户端身份（CLI 版本、social refresh 的 Desktop UA）；空字段用默认值。
 	Identity kiro.Identity `json:"identity,omitzero"`
 	// ReportedUsage 是上游报了 tokenUsage 时的口径（上游目前不报，这是预防）：
-	// conservative（默认：各字段取最后一次上报的值，缺失不覆盖，输入扣 Kiro 隐藏 token）| raw（不扣隐藏）|
+	// conservative（默认：各字段取最后一次上报的值，缺失不覆盖，保留 Kiro 自带输入）| raw（同 conservative，兼容旧配置）|
 	// sum（多条累加）| ignore（只用本地拆分）。等 probe usage 有结论再改。
 	ReportedUsage string `json:"reported_usage,omitzero"`
 	// CacheTTL 是 explicit / protocol 模式下对客户端 1h 声明的处理；auto 固定按 5m 计。

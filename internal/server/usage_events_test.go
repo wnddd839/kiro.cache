@@ -80,9 +80,6 @@ func TestPartialUsageEventsBilling(t *testing.T) {
 							want.CacheRead = 6000
 						}
 					}
-					if mode != kiro.ReportedRaw {
-						want.Input, want.CacheRead = stripHidden(want.Input, want.CacheRead, kiro.HiddenTokens("claude-sonnet-4.5"))
-					}
 					want.Credits = 0.5
 					body := convo("hi")
 					if streaming {
@@ -167,7 +164,7 @@ func TestFailedAttemptCacheBillingAcrossRequests(t *testing.T) {
 						if ttl == "1h" {
 							wantLong = 3000
 						}
-						if e.Input != 5000-kiro.HiddenTokens(e.Model) || e.CacheWrite != 3000 || e.CacheWrite1h != wantLong || e.Output != 0 {
+						if e.Input != 5000 || e.CacheWrite != 3000 || e.CacheWrite1h != wantLong || e.Output != 0 {
 							t.Fatalf("partial reported input lost before failover: %+v", e)
 						}
 					}

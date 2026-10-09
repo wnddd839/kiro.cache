@@ -1,7 +1,7 @@
 // Package meter 在本地计量一次请求：token 估算、prompt cache 命中模拟、按 API 标价折算费用。
 //
-// Kiro 不返回 token 数，只给上下文百分比和 credits。下游要做预算和分摊，
-// 需要的是「同一请求在 Anthropic API 上会怎么计费」：这里用同样的规则在本地算一遍。
+// Kiro 通常只给上下文百分比和 credits，不返回 token 数。
+// 客户端输入按缓存规则拆分，Kiro 自带输入按普通输入计费。
 package meter
 
 import (
@@ -110,13 +110,13 @@ func Scale1h(local1h, localWrite, write int) int {
 
 // Calibrate 用上游报的上下文 token 校正本地估算。
 //
-// upstream 是上游这一轮的上下文占用（百分比×窗口：含本轮输出，含 Kiro 自带部分），hidden 是 Kiro 自带部分。
-// 两者之差是本轮请求加输出的真实 token。本地估算的误差来自分词器不同（Claude 系约 ±4%，开放模型约多两成），
-// 各部分同向，所以输入三分与输出按同一比例缩放，总量对齐上游。
-// 比例离谱（窗口或基线不对）时不动，仍用本地估算。
+// upstream 是上游这一轮的上下文占用（百分比×窗口：含本轮输出，含 Kiro 自带部分）。
+// u.Input 已包含 hidden，先剥离这份固定基线，仅对客户端内容同比例校准，再按普通输入加回。
+// 缓存读写不重复包含 hidden；最终输入三分加输出对齐上游总量。
+// 比例离谱（窗口或基线不对）时不动，仍用包含基线的本地估算。
 func Calibrate(u turn.Usage, upstream, hidden int) turn.Usage {
 	content := upstream - hidden
-	local := u.PromptTokens() + u.Output
+	local := u.PromptTokens() + u.Output - hidden
 	if content <= 0 || local <= 0 {
 		return u
 	}
@@ -132,6 +132,6 @@ func Calibrate(u turn.Usage, upstream, hidden int) turn.Usage {
 	out.CacheRead = min(scale(u.CacheRead), prompt)
 	out.CacheWrite = min(scale(u.CacheWrite), prompt-out.CacheRead)
 	out.CacheWrite1h = Scale1h(u.CacheWrite1h, u.CacheWrite, out.CacheWrite)
-	out.Input = prompt - out.CacheRead - out.CacheWrite // 舍入差归到普通输入，总量与上游一致
+	out.Input = hidden + prompt - out.CacheRead - out.CacheWrite // 固定基线与舍入差归普通输入
 	return out
 }

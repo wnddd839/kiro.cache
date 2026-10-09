@@ -282,13 +282,13 @@ func (d *Decoder) tokenUsage(raw json.RawMessage) {
 }
 
 // ReportedMode 是上游报了 tokenUsage 时怎么用它。等 `probe usage` 有结论再定口径；
-// 默认 ReportedConservative：各字段取最后值、不累加、扣隐藏 token。
+// 默认 ReportedConservative：各字段取最后值、不累加、保留 Kiro 自带输入。
 const (
-	// ReportedConservative：各字段取最后一次上报的值；输入侧扣掉 Kiro 隐藏 token（先扣 uncached 再扣 cacheRead）。
+	// ReportedConservative：各字段取最后一次上报的值；输入侧包含 Kiro 自带部分，不扣除。
 	ReportedConservative = "conservative"
-	// ReportedRaw：各字段取最后一次上报的值；输入侧原样用（确认上游不含隐藏部分后再用）。
+	// ReportedRaw：兼容旧配置，与 conservative 同样保留上游报告值。
 	ReportedRaw = "raw"
-	// ReportedSum：多条累加（确认上游发的是增量后再用）；输入侧扣隐藏 token。
+	// ReportedSum：多条累加（确认上游发的是增量后再用），不扣 Kiro 自带输入。
 	ReportedSum = "sum"
 	// ReportedIgnore：不用上游 tokenUsage，只用本地拆分 + 上下文百分比校准。
 	ReportedIgnore = "ignore"

@@ -19,6 +19,8 @@ import (
 	"kiro-proxy/internal/config"
 	"kiro-proxy/internal/keys"
 	"kiro-proxy/internal/kiro"
+	"kiro-proxy/internal/meter"
+	"kiro-proxy/internal/turn"
 	"kiro-proxy/internal/usage"
 )
 
@@ -356,14 +358,14 @@ func TestAbortWithoutMeteringEstimatesCredits(t *testing.T) {
 // 两本账：每笔记对下游收费与上游成本；亏的笔单独计。
 func TestTwoLedgersAndLoss(t *testing.T) {
 	h := newHarness(t, 1, func(c *config.Config) { c.CreditUSD = 0.02 })
-	h.up.stream = func(string) []byte { // 极小请求：隐藏 token 让上游成本高于 Anthropic 口径
+	h.up.stream = func(string) []byte { // 极小请求但上游 credits 高，仍需保留亏损统计
 		b := frame("assistantResponseEvent", `{"content":"ok"}`)
-		return append(b, frame("meteringEvent", `{"unit":"credit","usage":0.01}`)...)
+		return append(b, frame("meteringEvent", `{"unit":"credit","usage":1}`)...)
 	}
 	decodeUsage(t, h.post(t, "/v1/messages", `{"model":"claude-sonnet-4.5","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`, nil))
 	v := waitRequests(t, h, usage.Query{}, 1)
 	e := v.Entries[0]
-	if math.Abs(e.UpstreamUSD-0.0002) > 1e-12 || e.CostUSD <= 0 || !e.Loss() {
+	if math.Abs(e.UpstreamUSD-0.02) > 1e-12 || e.CostUSD <= 0 || !e.Loss() {
 		t.Fatalf("entry %+v", e)
 	}
 	if v.Totals.Losses != 1 || math.Abs(v.Totals.LossUSD-(e.UpstreamUSD-e.CostUSD)) > 1e-12 {
@@ -523,11 +525,9 @@ func TestChat403RefreshOnlyForTokenErrors(t *testing.T) {
 	}
 }
 
-// 上游报了 tokenUsage（默认 conservative）：多条取最后一条不累加；输入扣 Kiro 隐藏 token，
-// 先扣 uncached，不够再扣 cacheRead。
+// 上游报了 tokenUsage：保留 Kiro 输入，取最后一次报告，不累加也不重复加基线。
 func TestReportedConservative(t *testing.T) {
 	h := newHarness(t, 1, nil)
-	hidden := kiro.HiddenTokens("claude-sonnet-4.5")
 	h.up.stream = func(string) []byte {
 		b := frame("assistantResponseEvent", `{"content":"ok"}`)
 		b = append(b, frame("metadataEvent", `{"tokenUsage":{"uncachedInputTokens":3000,"cacheReadInputTokens":9000,"outputTokens":1}}`)...)
@@ -535,13 +535,13 @@ func TestReportedConservative(t *testing.T) {
 		return b
 	}
 	u := decodeUsage(t, h.post(t, "/v1/messages", convo("x"), nil))
-	wantRead := 9000 - (hidden - 3000)
-	if u.Input != 0 || u.CacheRead != wantRead || u.Output != 2 {
-		t.Fatalf("usage %+v, want input 0 (uncached fully used up by hidden %d), cache_read %d, output 2 (last, not 3)", u, hidden, wantRead)
+	if u.Input != 3000 || u.CacheRead != 9000 || u.Output != 2 {
+		t.Fatalf("usage %+v, want input 3000, cache_read 9000, output 2", u)
 	}
-	// 扣到 0 为止
-	if in, rd := stripHidden(100, 200, 5000); in != 0 || rd != 0 {
-		t.Fatalf("stripHidden floor: %d %d", in, rd)
+	e := waitRequests(t, h, usage.Query{}, 1).Entries[0]
+	wantCredits := meter.EstimateCredits(meter.CreditRateOf(e.Model, nil), turn.Usage{Input: 3000, CacheRead: 9000, Output: 2}, 0)
+	if e.Input != 3000 || e.CacheRead != 9000 || e.Credits != wantCredits {
+		t.Fatalf("reported input should not add another Kiro baseline: %+v", e)
 	}
 }
 
@@ -583,7 +583,7 @@ func TestStreamStartNotAboveEnd(t *testing.T) {
 	}
 	_ = json.NewDecoder(res.Body).Decode(&ct)
 	for _, scale := range []float64{0.52, 1.0, 1.9} {
-		content := int(float64(ct.InputTokens) * scale)
+		content := int(float64(ct.InputTokens-kiro.HiddenTokens("claude-sonnet-4.5")) * scale)
 		h.up.stream = func(string) []byte {
 			b := frame("assistantResponseEvent", `{"content":"hello world"}`)
 			b = append(b, frame("contextUsageEvent", fmt.Sprintf(`{"contextUsagePercentage":%v}`, float64(content+kiro.HiddenTokens("claude-sonnet-4.5"))/2000))...)

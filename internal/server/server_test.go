@@ -247,7 +247,7 @@ const turn2 = `{"model":"claude-sonnet-4-5-20250929","max_tokens":100,
 "messages":[{"role":"user","content":"fix the bug"},{"role":"assistant","content":"ok"},{"role":"user","content":"and tests"}]}`
 
 func TestNonStreamResponseAndUsage(t *testing.T) {
-	// 桩上游报了 tokenUsage：raw 口径原样用（默认 conservative 会扣隐藏 token，见 TestReportedConservative）
+	// 桩上游报了 tokenUsage：保留报告输入，不再扣 Kiro 自带基线。
 	h := newHarness(t, 1, func(c *config.Config) { c.ReportedUsage = kiro.ReportedRaw })
 	res := h.post(t, "/v1/messages", fmt.Sprintf(turn1, "aaa"), nil)
 	if res.StatusCode != 200 {

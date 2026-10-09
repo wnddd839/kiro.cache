@@ -11,8 +11,8 @@ import (
 
 // 隐藏 token 漂移监控。
 //
-// Kiro 把自己的 system 与对话模板放进上下文（约 4052 token）。本地用这个常数从上游上下文百分比里扣掉它，
-// 再校准下游 token。Kiro 一改 prompt 这个数就变，校准会整体偏移。
+// Kiro 把自己的 system 与对话模板放进上下文（约 4052 token）。下游按普通输入计这份固定基线，
+// 校准时只缩放客户端内容。Kiro 一改 prompt 这个数就变，输入拆分会偏移。
 //
 // 反推：小请求（本地 prompt+输出 ≤ hiddenProbeMax）时本地分词误差只有几个 token，
 // 上游上下文 − 本地内容 ≈ 隐藏 token。按模型取最近 hiddenWindow 个反推值的中位数，
@@ -92,9 +92,9 @@ func (h *hiddenWatch) stats() []hiddenStat {
 	return out
 }
 
-// watchHidden 在上游报了上下文占用的小请求上反推隐藏 token。u 是本地计量（校准前）。
+// watchHidden 在上游报了上下文占用的小请求上反推隐藏 token。u 含固定基线，尚未校准。
 func (s *Server) watchHidden(model string, u turn.Usage, k kiro.Usage) {
-	local := u.PromptTokens() + u.Output
+	local := u.PromptTokens() + u.Output - kiro.HiddenTokens(model)
 	if k.Reported || k.Input <= 0 || local <= 0 || local > hiddenProbeMax {
 		return
 	}

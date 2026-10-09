@@ -13,6 +13,8 @@ import (
 	"kiro-proxy/internal/config"
 	"kiro-proxy/internal/keys"
 	"kiro-proxy/internal/kiro"
+	"kiro-proxy/internal/meter"
+	"kiro-proxy/internal/turn"
 	"kiro-proxy/internal/usage"
 )
 
@@ -69,6 +71,113 @@ func decodeUsage(t *testing.T, res *http.Response) usageBody {
 	return msg.Usage
 }
 
+func TestKiroInputBilledDownstream(t *testing.T) {
+	for _, model := range []string{"claude-sonnet-4.5", "deepseek-3.2"} {
+		for _, p := range []proto{protoAnthropic, protoChat, protoResponses} {
+			for _, streaming := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/%s/stream=%v", model, p, streaming), func(t *testing.T) {
+					h := newHarness(t, 1, nil)
+					h.up.stream = func(string) []byte { return frame("assistantResponseEvent", `{"content":"ok"}`) }
+					body := map[string]any{"model": model, "stream": streaming}
+					path := "/v1/messages"
+					switch p {
+					case protoChat:
+						path = "/v1/chat/completions"
+						body["messages"] = []any{map[string]string{"role": "system", "content": bigSystem}, map[string]string{"role": "user", "content": "hi"}}
+					case protoResponses:
+						path = "/v1/responses"
+						body["instructions"], body["input"] = bigSystem, "hi"
+					default:
+						body["system"] = bigSystem
+						body["messages"] = []any{map[string]string{"role": "user", "content": "hi"}}
+					}
+					raw, _ := json.Marshal(body)
+					read := func() (int, int, int) {
+						res := h.post(t, path, string(raw), nil)
+						if res.StatusCode != http.StatusOK {
+							t.Fatalf("status %d", res.StatusCode)
+						}
+						var final map[string]any
+						parse := func(raw []byte) {
+							var event struct {
+								Usage    map[string]any
+								Response struct{ Usage map[string]any }
+							}
+							if err := json.Unmarshal(raw, &event); err != nil {
+								t.Fatal(err)
+							}
+							if event.Usage != nil {
+								final = event.Usage
+							}
+							if event.Response.Usage != nil {
+								final = event.Response.Usage
+							}
+						}
+						if streaming {
+							sc := bufio.NewScanner(res.Body)
+							for sc.Scan() {
+								if data, ok := strings.CutPrefix(sc.Text(), "data: "); ok && data != "[DONE]" {
+									parse([]byte(data))
+								}
+							}
+							if err := sc.Err(); err != nil {
+								t.Fatal(err)
+							}
+						} else {
+							data, err := io.ReadAll(res.Body)
+							if err != nil {
+								t.Fatal(err)
+							}
+							parse(data)
+						}
+						if final == nil {
+							t.Fatal("missing final usage")
+						}
+						read, write := int(final["cache_read_input_tokens"].(float64)), int(final["cache_creation_input_tokens"].(float64))
+						inKey := "input_tokens"
+						if p == protoChat {
+							inKey = "prompt_tokens"
+						}
+						in := int(final[inKey].(float64))
+						if p != protoAnthropic {
+							in -= read + write
+						}
+						return in, read, write
+					}
+					hidden := kiro.HiddenTokens(model)
+					coldIn, coldRead, coldWrite := read()
+					warmIn, warmRead, warmWrite := read()
+					if coldIn != hidden || coldRead != 0 || coldWrite == 0 || warmIn != hidden || warmRead != coldWrite || warmWrite != 0 {
+						t.Fatalf("hidden=%d cold=(%d,%d,%d) warm=(%d,%d,%d)", hidden, coldIn, coldRead, coldWrite, warmIn, warmRead, warmWrite)
+					}
+					if p == protoAnthropic {
+						res := h.post(t, "/v1/messages/count_tokens", string(raw), nil)
+						var count struct {
+							Input int `json:"input_tokens"`
+						}
+						if err := json.NewDecoder(res.Body).Decode(&count); err != nil {
+							t.Fatal(err)
+						}
+						if count.Input != coldIn+coldRead+coldWrite {
+							t.Fatalf("count_tokens=%d differs from billed input=%d", count.Input, coldIn+coldRead+coldWrite)
+						}
+					}
+					entries := waitRequests(t, h, usage.Query{}, 2).Entries
+					for _, e := range entries {
+						if e.Input != hidden || e.CostUSD != h.s.pricer.Cost(model, turn.Usage{Input: e.Input, CacheRead: e.CacheRead, CacheWrite: e.CacheWrite, Output: e.Output}) {
+							t.Fatalf("hidden input missing from billing: %+v", e)
+						}
+						wantCredits := meter.EstimateCredits(meter.CreditRateOf(model, nil), turn.Usage{Input: e.Input - hidden, CacheRead: e.CacheRead, CacheWrite: e.CacheWrite, Output: e.Output}, hidden)
+						if e.Credits != wantCredits {
+							t.Fatalf("hidden input counted twice in credits: got %v want %v", e.Credits, wantCredits)
+						}
+					}
+				})
+			}
+		}
+	}
+}
+
 func TestLocalCacheMeteringAcrossTurns(t *testing.T) {
 	h := newHarness(t, 1, nil)
 	h.up.stream = kiroPlain
@@ -79,7 +188,7 @@ func TestLocalCacheMeteringAcrossTurns(t *testing.T) {
 		t.Fatalf("turn 1 usage = %+v", u1)
 	}
 	u2 := decodeUsage(t, h.post(t, "/v1/messages", cached(convo("fix the bug", "hello world", "and tests"), ""), session))
-	if u2.CacheRead != u1.CacheWrite+u1.Input {
+	if u2.CacheRead != u1.CacheWrite+u1.Input-kiro.HiddenTokens("claude-sonnet-4.5") {
 		t.Fatalf("turn 2 should read turn 1's prefix: %+v after %+v", u2, u1)
 	}
 	if u2.CacheWrite == 0 {
@@ -131,7 +240,7 @@ func TestUsageCalibratedToUpstreamContext(t *testing.T) {
 		t.Fatalf("count_tokens = %+v %v", ct, err)
 	}
 	// 上游内容比本地估算少 15%（开放模型分词器的典型情况）
-	content := ct.InputTokens * 85 / 100
+	content := (ct.InputTokens - kiro.HiddenTokens("claude-sonnet-4.5")) * 85 / 100
 	upstream := content + kiro.HiddenTokens("claude-sonnet-4.5")
 	h.up.stream = func(string) []byte {
 		var b []byte
@@ -142,8 +251,8 @@ func TestUsageCalibratedToUpstreamContext(t *testing.T) {
 	}
 	session := map[string]string{"X-Claude-Code-Session-Id": "cal"}
 	u := decodeUsage(t, h.post(t, "/v1/messages", body, session))
-	if got := u.Input + u.CacheRead + u.CacheWrite + u.Output; got != content {
-		t.Fatalf("downstream total %d, want upstream content %d (%+v, local %d)", got, content, u, ct.InputTokens)
+	if got := u.Input + u.CacheRead + u.CacheWrite + u.Output; got != upstream {
+		t.Fatalf("downstream total %d, want upstream %d (%+v, local %d)", got, upstream, u, ct.InputTokens)
 	}
 	if u.CacheWrite == 0 || u.Output == 0 || u.Credits != 0.5 {
 		t.Fatalf("split lost: %+v", u)
@@ -165,8 +274,8 @@ func TestUsageCalibratedToUpstreamContext(t *testing.T) {
 		}
 		last = ev.Usage
 	}
-	if got := last.Input + last.CacheRead + last.CacheWrite + last.Output; got != content || last.CacheRead == 0 {
-		t.Fatalf("stream message_delta usage %+v total %d, want %d with cache read", last, got, content)
+	if got := last.Input + last.CacheRead + last.CacheWrite + last.Output; got != upstream || last.CacheRead == 0 {
+		t.Fatalf("stream message_delta usage %+v total %d, want %d with cache read", last, got, upstream)
 	}
 }
 
